@@ -641,8 +641,33 @@ def _send_leaderboard(session_id, chat_id, quiz_title, neg_val, total_q, session
         """, (session_id, neg_val)).fetchall()
 
     if not rows:
-        bot.send_message(chat_id, f"🏁 *Quiz '{quiz_title}'* has ended\\!\n\nNo answers recorded\\.", parse_mode="MarkdownV2")
+        bot.send_message(chat_id, f"🏁 Quiz '{quiz_title}' has ended!\n\nNo answers recorded.", parse_mode="HTML")
         return
+
+    def short_name(raw):
+        """First name only + trailing emoji if present. Max 10 chars."""
+        import re as _re
+        n = (raw or "User").strip()
+        orig_parts = n.split()
+        # First space-separated token
+        first_token = orig_parts[0] if orig_parts else n
+        # Strip non-alphanumeric from both edges e.g. "(SANJANA)" → "SANJANA", "Surbhi(" → "Surbhi"
+        name = _re.sub(r'^[^a-zA-Z0-9]+', '', first_token)
+        name = _re.sub(r'[^a-zA-Z0-9]+$', '', name)
+        if not name:
+            name = first_token[:10]
+        # CamelCase split only for mixed-case names e.g. "PalakKeshri" → "Palak"
+        if name and not name.isupper() and not name.islower() and not name.isdigit():
+            parts = _re.sub(r'([A-Z])', r' \1', name).split()
+            if parts and parts[0].strip():
+                name = parts[0].strip()
+        # Truncate to 10 chars
+        if len(name) > 10:
+            name = name[:9] + "…"
+        # Keep trailing emoji e.g. "Sunny 🌞"
+        if len(orig_parts) > 1 and orig_parts[-1] and ord(orig_parts[-1][0]) > 127:
+            name = name + " " + orig_parts[-1]
+        return html_mod.escape(name)
 
     safe_title = html_mod.escape(quiz_title)
     players = []
@@ -653,36 +678,44 @@ def _send_leaderboard(session_id, chat_id, quiz_title, neg_val, total_q, session
         elapsed = int(r["last_at"] or 0) - int(r["first_at"] or 0)
         mins, sec = elapsed // 60, elapsed % 60
         pct  = (correct / total_q * 100) if total_q else 0.0
-        name = html_mod.escape((r["name"] or f"User{r['user_id']}")[:16])
+        name = short_name(r["name"] or f"User{r['user_id']}")
         players.append({"name": name, "correct": correct, "wrong": wrong,
                         "score": score, "mins": mins, "sec": sec, "pct": pct})
 
     SEP  = "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     SEP2 = "──────────────────────────────"
 
+    # Olympic podium — gold centre elevated
     if len(players) >= 3:
+        p1, p2, p3 = players[0], players[1], players[2]
         podium = (
-            f"  🥈 {players[1]['name']}     🥇 {players[0]['name']}     🥉 {players[2]['name']}\n"
-            f"  {players[1]['pct']:.0f}%{'':>10}{players[0]['pct']:.0f}%{'':>10}{players[2]['pct']:.0f}%"
+            f"        🥇 {p1['name']}\n"
+            f"🥈 {p2['name']}          🥉 {p3['name']}\n"
+            f"  {p2['pct']:.0f}%     {p1['pct']:.0f}%     {p3['pct']:.0f}%"
         )
     elif len(players) == 2:
+        p1, p2 = players[0], players[1]
         podium = (
-            f"  🥈 {players[1]['name']}     🥇 {players[0]['name']}\n"
-            f"  {players[1]['pct']:.0f}%          {players[0]['pct']:.0f}%"
+            f"   🥇 {p1['name']}\n"
+            f"🥈 {p2['name']}\n"
+            f"  {p2['pct']:.0f}%    {p1['pct']:.0f}%"
         )
     else:
-        podium = f"  🥇 {players[0]['name']}  —  {players[0]['pct']:.0f}%"
+        podium = f"🥇 {players[0]['name']}  —  {players[0]['pct']:.0f}%"
 
+    # Rank lines — ek line mein: icon name  ✅X | ❌X | 🎯score | X%
     rank_map = {0: "👑", 1: "🥈", 2: "🥉"}
     rank_lines = []
     for i, p in enumerate(players):
         icon = rank_map.get(i, f"{i+1}.")
         rank_lines.append(
-            f"{icon}  <b>{p['name']}</b>   ✅{p['correct']}  ❌{p['wrong']}  "
-            f"🎯{p['score']:.2f}  ⏱{p['mins']}m{p['sec']:02d}s"
+            f"{icon} <b>{p['name']}</b>  "
+            f"✅{p['correct']} | ❌{p['wrong']} | 🎯{p['score']:.2f} | {p['pct']:.0f}%"
         )
         if i == 2 and len(players) > 3:
             rank_lines.append(SEP2)
+
+    winner_time = f"{players[0]['mins']}m{players[0]['sec']:02d}s" if players else ""
 
     msg = (
         f"🎯 <b>Quiz '{safe_title}' — Results!</b>\n\n"
@@ -691,7 +724,7 @@ def _send_leaderboard(session_id, chat_id, quiz_title, neg_val, total_q, session
         f"{SEP}\n\n"
         + "\n".join(rank_lines)
         + f"\n\n{SEP}\n"
-        f"👥  <i>Participants: {len(rows)}</i>"
+        f"👥 <i>Participants: {len(rows)}</i>  |  ⏱ <i>{winner_time}</i>"
     )
 
     try:
@@ -700,10 +733,10 @@ def _send_leaderboard(session_id, chat_id, quiz_title, neg_val, total_q, session
         plain = [f"🎯 Quiz '{quiz_title}' — Results!\n", SEP]
         for i, p in enumerate(players):
             icon = ["👑", "🥈", "🥉"][i] if i < 3 else f"{i+1}."
-            plain.append(f"{icon} {p['name']}  ✅{p['correct']} ❌{p['wrong']}  🎯{p['score']:.2f}  ⏱{p['mins']}m{p['sec']:02d}s  {p['pct']:.0f}%")
+            plain.append(f"{icon} {p['name']}  ✅{p['correct']} | ❌{p['wrong']} | 🎯{p['score']:.2f} | {p['pct']:.0f}%")
             if i == 2 and len(players) > 3:
                 plain.append(SEP2)
-        plain.extend([SEP, f"👥 Participants: {len(rows)}"])
+        plain.extend([SEP, f"👥 Participants: {len(rows)}  |  ⏱ {winner_time}"])
         bot.send_message(chat_id, "\n".join(plain))
 
 def send_individual_result(chat_id, uid):
