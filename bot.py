@@ -10,6 +10,7 @@
 ║  ✅ Smart Reference Split: Kathan/Statements auto-split into ref_text        ║
 ║  ✅ Render Keep-Alive: Flask server integrated for 24/7 uptime               ║
 ║  ⚡ FAST DATABASE: Connection Pooling added for instant replies               ║
+║  ⚡ FAST POLLING: Timeout reduced for quicker Telegram responses             ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
 """
 
@@ -1850,10 +1851,13 @@ if __name__ == "__main__":
         while True:
             try:
                 logging.info("Bot is starting/connecting to Telegram...")
-                print("Bot is running... Press Ctrl+C to stop.")
+                print("Bot is running... Faster Polling Enabled.")
                 
+                # Timeout 30 se ghata kar 10 kar diya hai taaki response fast aaye
                 bot.infinity_polling(
-                    timeout=30, long_polling_timeout=30, skip_pending=True,
+                    timeout=10, 
+                    long_polling_timeout=5, 
+                    skip_pending=True,
                     allowed_updates=["message", "poll_answer", "callback_query", "inline_query"],
                     logger_level=20)
                     
@@ -1861,8 +1865,8 @@ if __name__ == "__main__":
                 print("\nBot stopped manually.")
                 break
             except Exception as e:
-                logging.error(f"Bot crashed with error: {e}", exc_info=True)
-                print(f"⚠️ Error occurred: {e}. Restarting in 10s...")
-                time.sleep(10)
+                logging.error(f"Bot crashed: {e}")
+                print(f"⚠️ Error: {e}. Restarting in 5s...")
+                time.sleep(5)
 
     start_bot()
