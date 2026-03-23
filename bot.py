@@ -1107,10 +1107,11 @@ function retryWrong(){{
 </script></body></html>"""
 
         fname = f"practice_{quiz_id}.html"
-        fpath = f"/tmp/{fname}"
-        with open(fpath, "w", encoding="utf-8") as f:
+        
+        with open(fname, "w", encoding="utf-8") as f:
             f.write(html_out)
-        with open(fpath, "rb") as f:
+            
+        with open(fname, "rb") as f:
             bot.send_document(
                 chat_id, InputFile(f, file_name=fname),
                 caption=(
@@ -1120,7 +1121,10 @@ function retryWrong(){{
                 ),
                 parse_mode="Markdown"
             )
-        os.remove(fpath)
+            
+        if os.path.exists(fname):
+            os.remove(fname)
+            
     except Exception as e:
         logging.error(f"Practice HTML export failed: {e}")
 
