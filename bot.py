@@ -273,7 +273,8 @@ def main_keyboard():
     kb = ReplyKeyboardMarkup(resize_keyboard=True, row_width=3)
     kb.add(KeyboardButton("/create"),   KeyboardButton("/myquizzes"),  KeyboardButton("/startquiz"),
            KeyboardButton("/features"), KeyboardButton("/stats"),      KeyboardButton("/loadfile"),
-           KeyboardButton("/result"),   KeyboardButton("/createhtml"), KeyboardButton("/testseries"))
+           KeyboardButton("/result"),   KeyboardButton("/createhtml"), KeyboardButton("/testseries"),
+           KeyboardButton("/practice"))
     return kb
 
 def quiz_card_kb(quiz_id, short_id=""):
@@ -675,6 +676,14 @@ def _finish_session(session_id):
     neg_val    = parse_neg_value(quiz["neg_marking"]) if quiz else 0.0
     _send_leaderboard(session_id, sess["chat_id"], quiz_title, neg_val, sess["total_q"], sess["start_time"])
 
+    # Quiz khatam hone ke baad interactive practice HTML send karo
+    if quiz:
+        threading.Thread(
+            target=_export_practice_html,
+            args=(sess["chat_id"], sess["quiz_id"]),
+            daemon=True
+        ).start()
+
 def _send_leaderboard(session_id, chat_id, quiz_title, neg_val, total_q, session_start):
     with get_db() as conn:
         rows = conn.execute("""
@@ -685,8 +694,27 @@ def _send_leaderboard(session_id, chat_id, quiz_title, neg_val, total_q, session
         """, (session_id, neg_val)).fetchall()
 
     if not rows:
-        bot.send_message(chat_id, f"🏁 *Quiz '{quiz_title}'* has ended\\!\n\nNo answers recorded\\.", parse_mode="MarkdownV2")
+        bot.send_message(chat_id, f"🏁 Quiz '{quiz_title}' has ended!\n\nNo answers recorded.", parse_mode="HTML")
         return
+
+    def short_name(raw):
+        """First name only + trailing emoji. Max 10 chars."""
+        import re as _re
+        n = (raw or "User").strip()
+        orig_parts = n.split()
+        first_token = orig_parts[0] if orig_parts else n
+        name = _re.sub(r'^[^a-zA-Z0-9]+', '', first_token)
+        name = _re.sub(r'[^a-zA-Z0-9]+$', '', name)
+        if not name: name = first_token[:10]
+        # CamelCase split: "PalakKeshri"→"Palak", "NavinKl"→"Navin"
+        if name and not name.isupper() and not name.islower() and not name.isdigit():
+            parts = _re.sub(r'([A-Z])', r' \1', name).split()
+            if parts and parts[0].strip(): name = parts[0].strip()
+        if len(name) > 10: name = name[:9] + "…"
+        # Keep trailing emoji e.g. "Sunny 🌞"
+        if len(orig_parts) > 1 and orig_parts[-1] and ord(orig_parts[-1][0]) > 127:
+            name = name + " " + orig_parts[-1]
+        return html_mod.escape(name)
 
     safe_title = html_mod.escape(quiz_title)
     players = []
@@ -697,36 +725,44 @@ def _send_leaderboard(session_id, chat_id, quiz_title, neg_val, total_q, session
         elapsed = int(r["last_at"] or 0) - int(r["first_at"] or 0)
         mins, sec = elapsed // 60, elapsed % 60
         pct  = (correct / total_q * 100) if total_q else 0.0
-        name = html_mod.escape((r["name"] or f"User{r['user_id']}")[:16])
+        name = short_name(r["name"] or f"User{r['user_id']}")
         players.append({"name": name, "correct": correct, "wrong": wrong,
                         "score": score, "mins": mins, "sec": sec, "pct": pct})
 
     SEP  = "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     SEP2 = "──────────────────────────────"
 
+    # Olympic podium — gold centre elevated
     if len(players) >= 3:
+        p1, p2, p3 = players[0], players[1], players[2]
         podium = (
-            f"  🥈 {players[1]['name']}     🥇 {players[0]['name']}     🥉 {players[2]['name']}\n"
-            f"  {players[1]['pct']:.0f}%{'':>10}{players[0]['pct']:.0f}%{'':>10}{players[2]['pct']:.0f}%"
+            f"        🥇 {p1['name']}\n"
+            f"🥈 {p2['name']}          🥉 {p3['name']}\n"
+            f"  {p2['pct']:.0f}%     {p1['pct']:.0f}%     {p3['pct']:.0f}%"
         )
     elif len(players) == 2:
+        p1, p2 = players[0], players[1]
         podium = (
-            f"  🥈 {players[1]['name']}     🥇 {players[0]['name']}\n"
-            f"  {players[1]['pct']:.0f}%          {players[0]['pct']:.0f}%"
+            f"   🥇 {p1['name']}\n"
+            f"🥈 {p2['name']}\n"
+            f"  {p2['pct']:.0f}%    {p1['pct']:.0f}%"
         )
     else:
-        podium = f"  🥇 {players[0]['name']}  —  {players[0]['pct']:.0f}%"
+        podium = f"🥇 {players[0]['name']}  —  {players[0]['pct']:.0f}%"
 
+    # Rank lines: icon name  ✅X | ❌X | 🎯score | X%
     rank_map = {0: "👑", 1: "🥈", 2: "🥉"}
     rank_lines = []
     for i, p in enumerate(players):
         icon = rank_map.get(i, f"{i+1}.")
         rank_lines.append(
-            f"{icon}  <b>{p['name']}</b>   ✅{p['correct']}  ❌{p['wrong']}  "
-            f"🎯{p['score']:.2f}  ⏱{p['mins']}m{p['sec']:02d}s"
+            f"{icon} <b>{p['name']}</b>  "
+            f"✅{p['correct']} | ❌{p['wrong']} | 🎯{p['score']:.2f} | {p['pct']:.0f}%"
         )
         if i == 2 and len(players) > 3:
             rank_lines.append(SEP2)
+
+    winner_time = f"{players[0]['mins']}m{players[0]['sec']:02d}s" if players else ""
 
     msg = (
         f"🎯 <b>Quiz '{safe_title}' — Results!</b>\n\n"
@@ -735,7 +771,7 @@ def _send_leaderboard(session_id, chat_id, quiz_title, neg_val, total_q, session
         f"{SEP}\n\n"
         + "\n".join(rank_lines)
         + f"\n\n{SEP}\n"
-        f"👥  <i>Participants: {len(rows)}</i>"
+        f"👥 <i>Participants: {len(rows)}</i>  |  ⏱ <i>{winner_time}</i>"
     )
 
     try:
@@ -744,10 +780,10 @@ def _send_leaderboard(session_id, chat_id, quiz_title, neg_val, total_q, session
         plain = [f"🎯 Quiz '{quiz_title}' — Results!\n", SEP]
         for i, p in enumerate(players):
             icon = ["👑", "🥈", "🥉"][i] if i < 3 else f"{i+1}."
-            plain.append(f"{icon} {p['name']}  ✅{p['correct']} ❌{p['wrong']}  🎯{p['score']:.2f}  ⏱{p['mins']}m{p['sec']:02d}s  {p['pct']:.0f}%")
+            plain.append(f"{icon} {p['name']}  ✅{p['correct']} | ❌{p['wrong']} | 🎯{p['score']:.2f} | {p['pct']:.0f}%")
             if i == 2 and len(players) > 3:
                 plain.append(SEP2)
-        plain.extend([SEP, f"👥 Participants: {len(rows)}"])
+        plain.extend([SEP, f"👥 Participants: {len(rows)}  |  ⏱ {winner_time}"])
         bot.send_message(chat_id, "\n".join(plain))
 
 def send_individual_result(chat_id, uid):
@@ -868,6 +904,213 @@ def _export_txt(chat_id, quiz_id):
     except Exception as e: safe_send(chat_id, f"Export failed: {e}")
     finally:
         if os.path.exists(fname): os.remove(fname)
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  INTERACTIVE PRACTICE HTML EXPORT
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _export_practice_html(chat_id, quiz_id):
+    """Quiz khatam hone ke baad interactive practice HTML file send karo."""
+    try:
+        with get_db() as conn:
+            quiz = conn.execute("SELECT * FROM quizzes WHERE quiz_id=?", (quiz_id,)).fetchone()
+            if not quiz: return
+            questions = conn.execute(
+                "SELECT * FROM questions WHERE quiz_id=? ORDER BY position,question_id", (quiz_id,)).fetchall()
+        if not questions: return
+
+        neg_val = parse_neg_value(quiz["neg_marking"])
+        neg_display = f"{neg_val:.6f}".rstrip('0').rstrip('.') if neg_val else "0"
+        total_q = len(questions)
+        timer_minutes = max(10, (total_q + 2) // 3)
+        timer_seconds_total = timer_minutes * 60
+
+        js_items = []
+        for q in questions:
+            opts = json.loads(q["options"])
+            js_items.append({
+                "q": q["q_text"],
+                "ref": q["ref_text"] or "",
+                "opts": opts,
+                "ans": q["correct_idx"]
+            })
+        js_questions = json.dumps(js_items, ensure_ascii=False)
+        safe_title = html_mod.escape(quiz["title"])
+
+        html_out = f"""<!DOCTYPE html>
+<html lang="hi"><head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>{safe_title}</title>
+<style>
+*{{box-sizing:border-box;margin:0;padding:0;}}
+body{{font-family:'Segoe UI',sans-serif;background:#f0f2f5;color:#222;}}
+#start-screen{{max-width:480px;margin:60px auto;background:#fff;border-radius:16px;padding:32px 24px;text-align:center;box-shadow:0 4px 20px rgba(0,0,0,.1);}}
+#start-screen h1{{font-size:26px;color:#3b3f9e;margin-bottom:6px;}}
+#start-screen p{{color:#888;font-size:14px;margin-bottom:20px;}}
+.info-row{{display:flex;justify-content:space-between;padding:11px 0;border-bottom:1px solid #eee;font-size:15px;}}
+.info-label{{color:#888;}}.info-value{{font-weight:600;}}
+#start-btn{{margin-top:22px;width:100%;padding:14px;background:#3b3f9e;color:#fff;border:none;border-radius:10px;font-size:17px;cursor:pointer;}}
+#start-btn:hover{{background:#2d3180;}}
+#hdr{{background:#3b3f9e;color:#fff;padding:10px 16px;display:flex;justify-content:space-between;align-items:center;position:sticky;top:0;z-index:100;}}
+#hdr h2{{font-size:15px;}}#timer{{font-size:20px;font-weight:700;color:#ffd700;}}
+#quiz-screen{{display:none;max-width:680px;margin:16px auto;padding:0 12px 80px;}}
+.qcard{{background:#fff;border-radius:12px;padding:20px;box-shadow:0 2px 10px rgba(0,0,0,.08);}}
+.qmeta{{font-size:11px;color:#3b3f9e;font-weight:700;margin-bottom:4px;}}
+.qref{{background:#f8f9fa;border-left:3px solid #aaa;padding:9px 13px;margin-bottom:10px;font-size:13px;color:#444;border-radius:4px;white-space:pre-wrap;}}
+.qtext{{font-size:15.5px;font-weight:600;line-height:1.65;margin-bottom:14px;}}
+.qmarks{{font-size:12px;color:#3b3f9e;margin-bottom:10px;}}
+.opt{{display:block;width:100%;text-align:left;padding:11px 15px;margin:7px 0;border:1.5px solid #ddd;border-radius:8px;background:#fff;font-size:14.5px;cursor:pointer;transition:all .15s;}}
+.opt:hover{{background:#f0f0ff;border-color:#3b3f9e;}}
+.opt.correct{{background:#e6f9ee;border-color:#27ae60;color:#1a7a42;font-weight:600;}}
+.opt.wrong{{background:#fdecea;border-color:#e74c3c;color:#c0392b;}}
+#nav{{position:fixed;bottom:0;left:0;right:0;background:#fff;padding:10px 14px;display:none;justify-content:space-between;gap:8px;box-shadow:0 -2px 10px rgba(0,0,0,.1);}}
+.nbtn{{flex:1;padding:12px;border:none;border-radius:8px;font-size:14px;cursor:pointer;font-weight:600;}}
+#pbtn{{background:#eee;color:#444;}}#rbtn{{background:#fff3cd;color:#856404;border:1.5px solid #ffc107;}}#nbtn{{background:#3b3f9e;color:#fff;}}
+#result-screen{{display:none;max-width:460px;margin:40px auto;background:#fff;border-radius:16px;padding:26px 20px;text-align:center;box-shadow:0 4px 20px rgba(0,0,0,.1);}}
+.rtitle{{font-size:22px;font-weight:700;color:#3b3f9e;margin-bottom:18px;}}
+.rgrid{{display:grid;grid-template-columns:1fr 1fr;gap:11px;margin-bottom:18px;}}
+.rbox{{background:#f0f2f5;border-radius:10px;padding:13px;}}.rval{{font-size:21px;font-weight:700;}}.rlbl{{font-size:12px;color:#777;margin-top:3px;}}
+.gc{{color:#27ae60;}}.rc{{color:#e74c3c;}}.bc{{color:#3b3f9e;}}
+.abtn{{width:100%;padding:12px;border:none;border-radius:9px;font-size:15px;cursor:pointer;color:#fff;margin-top:7px;font-weight:600;}}
+</style></head><body>
+<div id="start-screen">
+  <h1>📋 Practice Quiz</h1><p>Bihar Special BPSC PYQs</p>
+  <div class="info-row"><span class="info-label">Topic</span><span class="info-value">{safe_title}</span></div>
+  <div class="info-row"><span class="info-label">Questions</span><span class="info-value">{total_q}</span></div>
+  <div class="info-row"><span class="info-label">Timer</span><span class="info-value">{timer_minutes} Minutes</span></div>
+  <div class="info-row"><span class="info-label">N.Mark</span><span class="info-value">-{neg_display} per wrong answer</span></div>
+  <button id="start-btn" onclick="startQuiz()">Start</button>
+</div>
+<div id="quiz-screen">
+  <div id="hdr"><h2 id="qctr">Q 1 / {total_q}</h2><div id="timer">--:--</div></div>
+  <div class="qcard" style="margin-top:14px;">
+    <div class="qmeta" id="qmeta"></div>
+    <div class="qref" id="qref" style="display:none"></div>
+    <div class="qtext" id="qtext"></div>
+    <div class="qmarks">+1 / -{neg_display}</div>
+    <div id="opts"></div>
+  </div>
+</div>
+<div id="nav">
+  <button class="nbtn" id="pbtn" onclick="go(-1)">◀ Prev</button>
+  <button class="nbtn" id="rbtn" onclick="markRev()">🔖 Review</button>
+  <button class="nbtn" id="nbtn" onclick="go(1)">Next ▶</button>
+</div>
+<div id="result-screen">
+  <div class="rtitle">🏆 Result</div>
+  <div class="rgrid">
+    <div class="rbox"><div class="rval bc" id="rs"></div><div class="rlbl">Score</div></div>
+    <div class="rbox"><div class="rval" id="ra"></div><div class="rlbl">Accuracy</div></div>
+    <div class="rbox"><div class="rval gc" id="rc"></div><div class="rlbl">✅ Correct</div></div>
+    <div class="rbox"><div class="rval rc" id="rw"></div><div class="rlbl">❌ Wrong</div></div>
+    <div class="rbox"><div class="rval" id="rsk"></div><div class="rlbl">⏭ Skipped</div></div>
+    <div class="rbox"><div class="rval" id="rt"></div><div class="rlbl">⏱ Time</div></div>
+  </div>
+  <button class="abtn" style="background:#3b3f9e;" onclick="retryAll()">🔁 Play Again</button>
+  <button class="abtn" style="background:#e74c3c;" onclick="retryWrong()">📝 Review Mistakes</button>
+</div>
+<script>
+const ALL_QS={js_questions};
+const NEG={neg_val};
+const TOTAL_SECS={timer_seconds_total};
+let QS=ALL_QS.slice(),cur=0,ans={{}},rev=new Set(),tLeft=TOTAL_SECS,tiv=null,t0=null;
+function startQuiz(){{
+  document.getElementById('start-screen').style.display='none';
+  document.getElementById('quiz-screen').style.display='block';
+  document.getElementById('nav').style.display='flex';
+  t0=Date.now();startTimer();showQ(0);
+}}
+function startTimer(){{
+  tiv=setInterval(()=>{{
+    tLeft--;
+    const m=String(Math.floor(tLeft/60)).padStart(2,'0'),s=String(tLeft%60).padStart(2,'0');
+    document.getElementById('timer').textContent=m+':'+s;
+    if(tLeft<=0){{clearInterval(tiv);showResult();}}
+  }},1000);
+}}
+function showQ(i){{
+  cur=i;const q=QS[i];
+  document.getElementById('qctr').textContent='Q '+(i+1)+' / '+QS.length;
+  document.getElementById('qmeta').textContent='Question '+(i+1);
+  const refEl=document.getElementById('qref');
+  if(q.ref){{refEl.style.display='block';refEl.textContent=q.ref;}}else{{refEl.style.display='none';}}
+  document.getElementById('qtext').textContent='Q'+(i+1)+'. '+q.q;
+  const cont=document.getElementById('opts');cont.innerHTML='';
+  q.opts.forEach((o,j)=>{{
+    const b=document.createElement('button');b.className='opt';b.textContent=o;
+    if(ans[i]!==undefined){{
+      if(j===ans[i])b.classList.add(j===q.ans?'correct':'wrong');
+      else if(j===q.ans)b.classList.add('correct');
+      b.disabled=true;
+    }}else{{b.onclick=()=>pick(i,j);}}
+    cont.appendChild(b);
+  }});
+  document.getElementById('pbtn').disabled=i===0;
+  document.getElementById('nbtn').textContent=i===QS.length-1?'Submit ✓':'Next ▶';
+  document.getElementById('rbtn').style.background=rev.has(i)?'#ffc107':'';
+}}
+function pick(qi,oi){{
+  ans[qi]=oi;const q=QS[qi];
+  document.querySelectorAll('.opt').forEach((b,j)=>{{
+    b.disabled=true;
+    if(j===oi)b.classList.add(j===q.ans?'correct':'wrong');
+    else if(j===q.ans)b.classList.add('correct');
+  }});
+  setTimeout(()=>go(1),700);
+}}
+function go(d){{const nx=cur+d;if(nx<0)return;if(nx>=QS.length){{clearInterval(tiv);showResult();return;}}showQ(nx);}}
+function markRev(){{rev.has(cur)?rev.delete(cur):rev.add(cur);showQ(cur);}}
+function showResult(){{
+  document.getElementById('quiz-screen').style.display='none';
+  document.getElementById('nav').style.display='none';
+  document.getElementById('result-screen').style.display='block';
+  let c=0,w=0,sk=0;
+  QS.forEach((q,i)=>{{if(ans[i]===undefined)sk++;else if(ans[i]===q.ans)c++;else w++;}});
+  const score=c-w*NEG,acc=(c+w)>0?((c/(c+w))*100).toFixed(1):'0.0';
+  const el=Math.floor((Date.now()-t0)/1000);
+  document.getElementById('rs').textContent=score.toFixed(2);
+  document.getElementById('ra').textContent=acc+'%';
+  document.getElementById('rc').textContent=c;
+  document.getElementById('rw').textContent=w;
+  document.getElementById('rsk').textContent=sk;
+  document.getElementById('rt').textContent=Math.floor(el/60)+'m '+String(el%60).padStart(2,'0')+'s';
+}}
+function retryAll(){{
+  QS=ALL_QS.slice();ans={{}};rev=new Set();tLeft=TOTAL_SECS;cur=0;
+  document.getElementById('result-screen').style.display='none';
+  document.getElementById('quiz-screen').style.display='block';
+  document.getElementById('nav').style.display='flex';
+  t0=Date.now();clearInterval(tiv);startTimer();showQ(0);
+}}
+function retryWrong(){{
+  const wrong=ALL_QS.filter((q,i)=>ans[i]!==undefined&&ans[i]!==q.ans);
+  if(!wrong.length){{alert('Koi wrong answer nahi!');return;}}
+  QS=wrong;ans={{}};rev=new Set();tLeft=Math.max(300,wrong.length*20);cur=0;
+  document.getElementById('result-screen').style.display='none';
+  document.getElementById('quiz-screen').style.display='block';
+  document.getElementById('nav').style.display='flex';
+  t0=Date.now();clearInterval(tiv);startTimer();showQ(0);
+}}
+</script></body></html>"""
+
+        fname = f"practice_{quiz_id}.html"
+        fpath = f"/tmp/{fname}"
+        with open(fpath, "w", encoding="utf-8") as f:
+            f.write(html_out)
+        with open(fpath, "rb") as f:
+            bot.send_document(
+                chat_id, InputFile(f, file_name=fname),
+                caption=(
+                    f"📋 *Quiz:* {quiz['title']}\n\n"
+                    f"📥 Download → Open in any browser (Chrome recommended)\n\n"
+                    f"❓ Questions: {total_q} | ⏱ Timer: {timer_minutes} min | ➖ N.Mark: -{neg_display}"
+                ),
+                parse_mode="Markdown"
+            )
+        os.remove(fpath)
+    except Exception as e:
+        logging.error(f"Practice HTML export failed: {e}")
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  COMMANDS
@@ -1139,6 +1382,24 @@ def cmd_html(msg):
         new = 1 - int(old["html_toggle"] or 0)
         conn.execute("UPDATE users SET html_toggle=? WHERE user_id=?", (new, uid))
     safe_send(msg.chat.id, f"HTML reports: *{'ON' if new else 'OFF'}*.", parse_mode="Markdown")
+
+@bot.message_handler(commands=["practice"])
+def cmd_practice(msg):
+    if group_only_reply(msg): return
+    register_user(msg)
+    uid, parts = msg.from_user.id, msg.text.split(maxsplit=1)
+    if len(parts) > 1 and parts[1].strip().isdigit():
+        safe_send(msg.chat.id, "⏳ Practice HTML generate ho rahi hai...")
+        threading.Thread(target=_export_practice_html, args=(msg.chat.id, int(parts[1].strip())), daemon=True).start()
+    else:
+        with get_db() as conn:
+            last = conn.execute(
+                "SELECT quiz_id FROM active_sessions WHERE user_id=? ORDER BY session_id DESC LIMIT 1", (uid,)).fetchone()
+        if last:
+            safe_send(msg.chat.id, "⏳ Practice HTML generate ho rahi hai...")
+            threading.Thread(target=_export_practice_html, args=(msg.chat.id, last["quiz_id"]), daemon=True).start()
+        else:
+            safe_send(msg.chat.id, "Usage: `/practice <quiz_id>`\n\nYa pehle koi quiz khatam karo.", parse_mode="Markdown")
 
 @bot.message_handler(commands=["createhtml"])
 def cmd_createhtml(msg):
