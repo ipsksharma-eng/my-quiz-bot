@@ -12,7 +12,9 @@
 ╚══════════════════════════════════════════════════════════════════════════════╝
 """
 
-import telebot, sqlite3, json, re, os, random, string, html as html_mod, threading, logging, time
+import telebot, json, re, os, random, string, html as html_mod, threading, logging, time
+import psycopg2
+from psycopg2.extras import DictCursor
 from datetime import datetime
 from telebot.types import (ReplyKeyboardMarkup, KeyboardButton,
                            InlineKeyboardMarkup, InlineKeyboardButton, InputFile,
@@ -51,7 +53,7 @@ logging.basicConfig(
 logging.info("Bot script started/restarted.")
 
 TOKEN    = "8599439624:AAEMj-en21FpmUk7_Pe7PmbPQ_3rgkg_8bU"
-DB_PATH  = "quizbot.db"
+DATABASE_URL = os.environ.get("DATABASE_URL", "")  # Render env variable mein daalo
 BOT_USER = "SDiscussion_bot"   # without @
 OWNER_ID = 863857194   # ← Apna Telegram user_id yahan daalo (int), e.g. 123456789
 
@@ -65,26 +67,57 @@ _CORRECT = "\u2705"   # ✅
 #  DATABASE
 # ══════════════════════════════════════════════════════════════════════════════
 
+# ══════════════════════════════════════════════════════════════════════════════
+#  POSTGRESQL WRAPPER — sqlite3 jaisa interface deta hai
+# ══════════════════════════════════════════════════════════════════════════════
+
+class _PgWrapper:
+    """psycopg2 connection ko sqlite3 jaisa banata hai — baki code same rehta hai"""
+    def __init__(self, conn):
+        self._conn = conn
+
+    def _fix(self, sql):
+        return sql.replace("?", "%s")
+
+    def execute(self, sql, params=()):
+        cur = self._conn.cursor(cursor_factory=DictCursor)
+        cur.execute(self._fix(sql), params)
+        return cur
+
+    def executemany(self, sql, params_list):
+        cur = self._conn.cursor(cursor_factory=DictCursor)
+        cur.executemany(self._fix(sql), params_list)
+        return cur
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if exc_type:
+            self._conn.rollback()
+        else:
+            self._conn.commit()
+        self._conn.close()
+        return False
+
 def get_db():
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=20.0)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA foreign_keys=ON")
-    return conn
+    conn = psycopg2.connect(DATABASE_URL)
+    return _PgWrapper(conn)
 
 def init_db():
     with get_db() as conn:
-        conn.executescript("""
+        conn.execute("""
         CREATE TABLE IF NOT EXISTS users (
-            user_id INTEGER PRIMARY KEY, username TEXT, first_name TEXT,
+            user_id BIGINT PRIMARY KEY, username TEXT, first_name TEXT,
             html_toggle INTEGER NOT NULL DEFAULT 0,
             state TEXT NOT NULL DEFAULT 'idle',
-            created_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
-        );
+            created_at INTEGER NOT NULL DEFAULT EXTRACT(EPOCH FROM NOW())::INTEGER
+        )""")
+        conn.execute("""
         CREATE TABLE IF NOT EXISTS quizzes (
-            quiz_id     INTEGER PRIMARY KEY AUTOINCREMENT,
+            quiz_id     SERIAL PRIMARY KEY,
             short_id    TEXT NOT NULL DEFAULT '',
-            creator_id  INTEGER NOT NULL,
+            creator_id  BIGINT NOT NULL,
             title       TEXT NOT NULL,
             neg_marking TEXT NOT NULL DEFAULT '0',
             quiz_type   TEXT NOT NULL DEFAULT 'free',
@@ -92,74 +125,82 @@ def init_db():
             shuffle_q   INTEGER NOT NULL DEFAULT 0,
             shuffle_o   INTEGER NOT NULL DEFAULT 0,
             section_quiz INTEGER NOT NULL DEFAULT 0,
-            created_at  INTEGER NOT NULL DEFAULT (strftime('%s','now'))
-        );
+            created_at  INTEGER NOT NULL DEFAULT EXTRACT(EPOCH FROM NOW())::INTEGER
+        )""")
+        conn.execute("""
         CREATE TABLE IF NOT EXISTS questions (
-            question_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            question_id SERIAL PRIMARY KEY,
             quiz_id     INTEGER NOT NULL REFERENCES quizzes(quiz_id) ON DELETE CASCADE,
             ref_text    TEXT NOT NULL DEFAULT '',
             q_text      TEXT NOT NULL,
             options     TEXT NOT NULL,
             correct_idx INTEGER NOT NULL,
             position    INTEGER NOT NULL DEFAULT 0
-        );
+        )""")
+        conn.execute("""
         CREATE TABLE IF NOT EXISTS active_sessions (
-            session_id    INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id       INTEGER NOT NULL,
+            session_id    SERIAL PRIMARY KEY,
+            user_id       BIGINT NOT NULL,
             quiz_id       INTEGER NOT NULL,
-            chat_id       INTEGER NOT NULL,
+            chat_id       BIGINT NOT NULL,
             current_q_idx INTEGER NOT NULL DEFAULT 0,
             is_paused     INTEGER NOT NULL DEFAULT 0,
             is_completed  INTEGER NOT NULL DEFAULT 0,
             total_q       INTEGER NOT NULL DEFAULT 0,
             shuffled_order TEXT NOT NULL DEFAULT '[]',
-            start_time    INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+            start_time    INTEGER NOT NULL DEFAULT EXTRACT(EPOCH FROM NOW())::INTEGER,
             end_time      INTEGER
-        );
+        )""")
+        conn.execute("""
         CREATE TABLE IF NOT EXISTS session_results (
-            result_id    INTEGER PRIMARY KEY AUTOINCREMENT,
+            result_id    SERIAL PRIMARY KEY,
             session_id   INTEGER NOT NULL,
-            user_id      INTEGER NOT NULL,
+            user_id      BIGINT NOT NULL,
             participant_name TEXT NOT NULL DEFAULT '',
             question_id  INTEGER NOT NULL,
             selected_idx INTEGER,
             is_correct   INTEGER NOT NULL DEFAULT 0,
-            answered_at  INTEGER NOT NULL DEFAULT (strftime('%s','now'))
-        );
+            answered_at  INTEGER NOT NULL DEFAULT EXTRACT(EPOCH FROM NOW())::INTEGER
+        )""")
+        conn.execute("""
         CREATE TABLE IF NOT EXISTS poll_map (
             poll_id     TEXT PRIMARY KEY,
             session_id  INTEGER NOT NULL,
             question_id INTEGER NOT NULL,
             correct_idx INTEGER NOT NULL,
-            owner_id    INTEGER NOT NULL
-        );
-        CREATE INDEX IF NOT EXISTS idx_q  ON questions(quiz_id);
-        CREATE INDEX IF NOT EXISTS idx_sr ON session_results(session_id, user_id);
-        CREATE INDEX IF NOT EXISTS idx_as ON active_sessions(user_id, chat_id, is_completed);
+            owner_id    BIGINT NOT NULL
+        )""")
+        conn.execute("""
         CREATE TABLE IF NOT EXISTS banned_users (
-            user_id   INTEGER PRIMARY KEY,
-            banned_by INTEGER,
+            user_id   BIGINT PRIMARY KEY,
+            banned_by BIGINT,
             reason    TEXT NOT NULL DEFAULT '',
-            banned_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
-        );
-        """)
+            banned_at INTEGER NOT NULL DEFAULT EXTRACT(EPOCH FROM NOW())::INTEGER
+        )""")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_q  ON questions(quiz_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_sr ON session_results(session_id, user_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_as ON active_sessions(user_id, chat_id, is_completed)")
+
+    # Migrations — naye columns add karo agar pehle se nahi hain
     migrations = [
-        ("quizzes",          "timer_seconds", "INTEGER NOT NULL DEFAULT 45"),
-        ("quizzes",          "shuffle_q",     "INTEGER NOT NULL DEFAULT 0"),
-        ("quizzes",          "shuffle_o",     "INTEGER NOT NULL DEFAULT 0"),
-        ("quizzes",          "section_quiz",  "INTEGER NOT NULL DEFAULT 0"),
-        ("quizzes",          "short_id",      "TEXT NOT NULL DEFAULT ''"),
-        ("quizzes",          "neg_marking",   "TEXT NOT NULL DEFAULT '0'"),
-        ("quizzes",          "quiz_type",     "TEXT NOT NULL DEFAULT 'free'"),
-        ("questions",        "ref_text",      "TEXT NOT NULL DEFAULT ''"),
-        ("questions",        "position",      "INTEGER NOT NULL DEFAULT 0"),
-        ("session_results",  "participant_name", "TEXT NOT NULL DEFAULT ''"),
-        ("active_sessions",  "shuffled_order","TEXT NOT NULL DEFAULT '[]'"),
+        ("quizzes",          "timer_seconds",    "INTEGER NOT NULL DEFAULT 45"),
+        ("quizzes",          "shuffle_q",         "INTEGER NOT NULL DEFAULT 0"),
+        ("quizzes",          "shuffle_o",         "INTEGER NOT NULL DEFAULT 0"),
+        ("quizzes",          "section_quiz",      "INTEGER NOT NULL DEFAULT 0"),
+        ("quizzes",          "short_id",          "TEXT NOT NULL DEFAULT ''"),
+        ("quizzes",          "neg_marking",       "TEXT NOT NULL DEFAULT '0'"),
+        ("quizzes",          "quiz_type",         "TEXT NOT NULL DEFAULT 'free'"),
+        ("questions",        "ref_text",          "TEXT NOT NULL DEFAULT ''"),
+        ("questions",        "position",          "INTEGER NOT NULL DEFAULT 0"),
+        ("session_results",  "participant_name",  "TEXT NOT NULL DEFAULT ''"),
+        ("active_sessions",  "shuffled_order",    "TEXT NOT NULL DEFAULT '[]'"),
     ]
     with get_db() as conn:
         for table, col, defn in migrations:
-            try: conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {defn}")
-            except Exception: pass
+            try:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {col} {defn}")
+            except Exception:
+                pass
 
 init_db()
 
@@ -507,9 +548,10 @@ def create_quiz_and_save(uid, title, questions, neg="0", quiz_type="free", timer
     short_id = make_short_id()
     with get_db() as conn:
         while conn.execute("SELECT 1 FROM quizzes WHERE short_id=?", (short_id,)).fetchone(): short_id = make_short_id()
-        cur = conn.execute("INSERT INTO quizzes(creator_id,title,short_id,neg_marking,quiz_type,timer_seconds) VALUES(?,?,?,?,?,?)",
-                           (uid, title, short_id, neg, quiz_type, timer))
-        quiz_id = cur.lastrowid
+        cur = conn.execute(
+            "INSERT INTO quizzes(creator_id,title,short_id,neg_marking,quiz_type,timer_seconds) VALUES(?,?,?,?,?,?) RETURNING quiz_id",
+            (uid, title, short_id, neg, quiz_type, timer))
+        quiz_id = cur.fetchone()[0]
         conn.executemany("INSERT INTO questions(quiz_id,ref_text,q_text,options,correct_idx,position) VALUES(?,?,?,?,?,?)",
                          [(quiz_id, r, q, json.dumps(o, ensure_ascii=False), c, i) for i, (r, q, o, c) in enumerate(questions)])
     return quiz_id, short_id, len(questions)
@@ -598,7 +640,9 @@ def send_next_poll(session_id):
             is_anonymous=False, open_period=period)
 
         with get_db() as conn:
-            conn.execute("INSERT OR REPLACE INTO poll_map(poll_id,session_id,question_id,correct_idx,owner_id) VALUES(?,?,?,?,?)",
+            conn.execute(
+                "INSERT INTO poll_map(poll_id,session_id,question_id,correct_idx,owner_id) VALUES(?,?,?,?,?) "
+                "ON CONFLICT (poll_id) DO UPDATE SET session_id=EXCLUDED.session_id, question_id=EXCLUDED.question_id, correct_idx=EXCLUDED.correct_idx, owner_id=EXCLUDED.owner_id",
                          (msg.poll.id, session_id, q["question_id"], correct_idx, sess["user_id"]))
             conn.execute("UPDATE active_sessions SET current_q_idx=? WHERE session_id=?", (q_idx+1, session_id))
 
@@ -625,7 +669,7 @@ def _finish_session(session_id):
     with get_db() as conn:
         sess = conn.execute("SELECT * FROM active_sessions WHERE session_id=?", (session_id,)).fetchone()
         if not sess: return
-        conn.execute("UPDATE active_sessions SET is_completed=1,end_time=strftime('%s','now') WHERE session_id=?", (session_id,))
+        conn.execute("UPDATE active_sessions SET is_completed=1,end_time=EXTRACT(EPOCH FROM NOW())::INTEGER WHERE session_id=?", (session_id,))
         quiz = conn.execute("SELECT * FROM quizzes WHERE quiz_id=?", (sess["quiz_id"],)).fetchone()
     quiz_title = quiz["title"] if quiz else "Quiz"
     neg_val    = parse_neg_value(quiz["neg_marking"]) if quiz else 0.0
@@ -641,33 +685,8 @@ def _send_leaderboard(session_id, chat_id, quiz_title, neg_val, total_q, session
         """, (session_id, neg_val)).fetchall()
 
     if not rows:
-        bot.send_message(chat_id, f"🏁 Quiz '{quiz_title}' has ended!\n\nNo answers recorded.", parse_mode="HTML")
+        bot.send_message(chat_id, f"🏁 *Quiz '{quiz_title}'* has ended\\!\n\nNo answers recorded\\.", parse_mode="MarkdownV2")
         return
-
-    def short_name(raw):
-        """First name only + trailing emoji if present. Max 10 chars."""
-        import re as _re
-        n = (raw or "User").strip()
-        orig_parts = n.split()
-        # First space-separated token
-        first_token = orig_parts[0] if orig_parts else n
-        # Strip non-alphanumeric from both edges e.g. "(SANJANA)" → "SANJANA", "Surbhi(" → "Surbhi"
-        name = _re.sub(r'^[^a-zA-Z0-9]+', '', first_token)
-        name = _re.sub(r'[^a-zA-Z0-9]+$', '', name)
-        if not name:
-            name = first_token[:10]
-        # CamelCase split only for mixed-case names e.g. "PalakKeshri" → "Palak"
-        if name and not name.isupper() and not name.islower() and not name.isdigit():
-            parts = _re.sub(r'([A-Z])', r' \1', name).split()
-            if parts and parts[0].strip():
-                name = parts[0].strip()
-        # Truncate to 10 chars
-        if len(name) > 10:
-            name = name[:9] + "…"
-        # Keep trailing emoji e.g. "Sunny 🌞"
-        if len(orig_parts) > 1 and orig_parts[-1] and ord(orig_parts[-1][0]) > 127:
-            name = name + " " + orig_parts[-1]
-        return html_mod.escape(name)
 
     safe_title = html_mod.escape(quiz_title)
     players = []
@@ -678,44 +697,36 @@ def _send_leaderboard(session_id, chat_id, quiz_title, neg_val, total_q, session
         elapsed = int(r["last_at"] or 0) - int(r["first_at"] or 0)
         mins, sec = elapsed // 60, elapsed % 60
         pct  = (correct / total_q * 100) if total_q else 0.0
-        name = short_name(r["name"] or f"User{r['user_id']}")
+        name = html_mod.escape((r["name"] or f"User{r['user_id']}")[:16])
         players.append({"name": name, "correct": correct, "wrong": wrong,
                         "score": score, "mins": mins, "sec": sec, "pct": pct})
 
     SEP  = "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     SEP2 = "──────────────────────────────"
 
-    # Olympic podium — gold centre elevated
     if len(players) >= 3:
-        p1, p2, p3 = players[0], players[1], players[2]
         podium = (
-            f"        🥇 {p1['name']}\n"
-            f"🥈 {p2['name']}          🥉 {p3['name']}\n"
-            f"  {p2['pct']:.0f}%     {p1['pct']:.0f}%     {p3['pct']:.0f}%"
+            f"  🥈 {players[1]['name']}     🥇 {players[0]['name']}     🥉 {players[2]['name']}\n"
+            f"  {players[1]['pct']:.0f}%{'':>10}{players[0]['pct']:.0f}%{'':>10}{players[2]['pct']:.0f}%"
         )
     elif len(players) == 2:
-        p1, p2 = players[0], players[1]
         podium = (
-            f"   🥇 {p1['name']}\n"
-            f"🥈 {p2['name']}\n"
-            f"  {p2['pct']:.0f}%    {p1['pct']:.0f}%"
+            f"  🥈 {players[1]['name']}     🥇 {players[0]['name']}\n"
+            f"  {players[1]['pct']:.0f}%          {players[0]['pct']:.0f}%"
         )
     else:
-        podium = f"🥇 {players[0]['name']}  —  {players[0]['pct']:.0f}%"
+        podium = f"  🥇 {players[0]['name']}  —  {players[0]['pct']:.0f}%"
 
-    # Rank lines — ek line mein: icon name  ✅X | ❌X | 🎯score | X%
     rank_map = {0: "👑", 1: "🥈", 2: "🥉"}
     rank_lines = []
     for i, p in enumerate(players):
         icon = rank_map.get(i, f"{i+1}.")
         rank_lines.append(
-            f"{icon} <b>{p['name']}</b>  "
-            f"✅{p['correct']} | ❌{p['wrong']} | 🎯{p['score']:.2f} | {p['pct']:.0f}%"
+            f"{icon}  <b>{p['name']}</b>   ✅{p['correct']}  ❌{p['wrong']}  "
+            f"🎯{p['score']:.2f}  ⏱{p['mins']}m{p['sec']:02d}s"
         )
         if i == 2 and len(players) > 3:
             rank_lines.append(SEP2)
-
-    winner_time = f"{players[0]['mins']}m{players[0]['sec']:02d}s" if players else ""
 
     msg = (
         f"🎯 <b>Quiz '{safe_title}' — Results!</b>\n\n"
@@ -724,7 +735,7 @@ def _send_leaderboard(session_id, chat_id, quiz_title, neg_val, total_q, session
         f"{SEP}\n\n"
         + "\n".join(rank_lines)
         + f"\n\n{SEP}\n"
-        f"👥 <i>Participants: {len(rows)}</i>  |  ⏱ <i>{winner_time}</i>"
+        f"👥  <i>Participants: {len(rows)}</i>"
     )
 
     try:
@@ -733,10 +744,10 @@ def _send_leaderboard(session_id, chat_id, quiz_title, neg_val, total_q, session
         plain = [f"🎯 Quiz '{quiz_title}' — Results!\n", SEP]
         for i, p in enumerate(players):
             icon = ["👑", "🥈", "🥉"][i] if i < 3 else f"{i+1}."
-            plain.append(f"{icon} {p['name']}  ✅{p['correct']} | ❌{p['wrong']} | 🎯{p['score']:.2f} | {p['pct']:.0f}%")
+            plain.append(f"{icon} {p['name']}  ✅{p['correct']} ❌{p['wrong']}  🎯{p['score']:.2f}  ⏱{p['mins']}m{p['sec']:02d}s  {p['pct']:.0f}%")
             if i == 2 and len(players) > 3:
                 plain.append(SEP2)
-        plain.extend([SEP, f"👥 Participants: {len(rows)}  |  ⏱ {winner_time}"])
+        plain.extend([SEP, f"👥 Participants: {len(rows)}"])
         bot.send_message(chat_id, "\n".join(plain))
 
 def send_individual_result(chat_id, uid):
@@ -1033,8 +1044,8 @@ def _countdown_and_start(chat_id, uid, quiz_id, show_countdown=True):
 
         q_ids = [q["question_id"] for q in qs]
         if quiz["shuffle_q"]: random.shuffle(q_ids)
-        cur = conn.execute("INSERT INTO active_sessions(user_id,quiz_id,chat_id,total_q,shuffled_order) VALUES(?,?,?,?,?)", (uid, quiz_id, chat_id, len(qs), json.dumps(q_ids)))
-        sid = cur.lastrowid
+        cur = conn.execute("INSERT INTO active_sessions(user_id,quiz_id,chat_id,total_q,shuffled_order) VALUES(?,?,?,?,?) RETURNING session_id", (uid, quiz_id, chat_id, len(qs), json.dumps(q_ids)))
+        sid = cur.fetchone()[0]
 
     if show_countdown and is_group(chat_id):
         try:
@@ -1082,7 +1093,7 @@ def cmd_stop(msg):
         if not s: return safe_send(msg.chat.id, "No active session.")
         sess = conn.execute("SELECT * FROM active_sessions WHERE session_id=?", (s["session_id"],)).fetchone()
         quiz = conn.execute("SELECT * FROM quizzes WHERE quiz_id=?", (sess["quiz_id"],)).fetchone()
-        conn.execute("UPDATE active_sessions SET is_completed=1,end_time=strftime('%s','now') WHERE session_id=?", (s["session_id"],))
+        conn.execute("UPDATE active_sessions SET is_completed=1,end_time=EXTRACT(EPOCH FROM NOW())::INTEGER WHERE session_id=?", (s["session_id"],))
     _cancel_auto_timer(s["session_id"])
     safe_send(msg.chat.id, "🛑 *Session stopped.*", parse_mode="Markdown")
     neg_val = parse_neg_value(quiz["neg_marking"]) if quiz else 0.0
@@ -1330,7 +1341,9 @@ def cmd_ban(msg):
     target_id = int(parts[1])
     reason = parts[2] if len(parts) > 2 else "No reason given"
     with get_db() as conn:
-        conn.execute("INSERT OR REPLACE INTO banned_users(user_id, banned_by, reason) VALUES(?,?,?)",
+        conn.execute(
+            "INSERT INTO banned_users(user_id, banned_by, reason) VALUES(?,?,?) "
+            "ON CONFLICT (user_id) DO UPDATE SET banned_by=EXCLUDED.banned_by, reason=EXCLUDED.reason",
                      (target_id, msg.from_user.id, reason))
         user = conn.execute("SELECT first_name, username FROM users WHERE user_id=?", (target_id,)).fetchone()
     name = (user["first_name"] or str(target_id)) if user else str(target_id)
@@ -1554,7 +1567,7 @@ def handle_inline_query(inline_query):
 if __name__ == "__main__":
     print("=" * 60)
     print("  QuizBot Pro v4.4 (Render-Ready + Auto-Restart)")
-    print(f"  DB: {DB_PATH} | Bot: @{BOT_USER}")
+    print(f"  DB: Supabase PostgreSQL | Bot: @{BOT_USER}")
     print("=" * 60)
     
     # Start the web server in the background
