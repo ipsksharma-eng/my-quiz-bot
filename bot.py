@@ -14,7 +14,7 @@
 ╚══════════════════════════════════════════════════════════════════════════════╝
 """
 
-import telebot, json, re, os, random, string, html as html_mod, threading, logging, time
+import telebot, json, re, os, random, string, html as html_mod, threading, logging, time, io
 import psycopg2
 from psycopg2.extras import DictCursor
 from psycopg2 import pool
@@ -925,6 +925,9 @@ def _export_txt(chat_id, quiz_id):
 def _export_practice_html(chat_id, quiz_id):
     """Quiz khatam hone ke baad interactive practice HTML file send karo."""
     try:
+        # Leaderboard aur file ek sath aane se flood wait na aaye isliye 2 second ka gap
+        time.sleep(2) 
+
         with get_db() as conn:
             quiz = conn.execute("SELECT * FROM quizzes WHERE quiz_id=?", (quiz_id,)).fetchone()
             if not quiz: return
@@ -1106,27 +1109,27 @@ function retryWrong(){{
 }}
 </script></body></html>"""
 
-        fname = f"practice_{quiz_id}.html"
-        
-        with open(fname, "w", encoding="utf-8") as f:
-            f.write(html_out)
-            
-        with open(fname, "rb") as f:
-            bot.send_document(
-                chat_id, InputFile(f, file_name=fname),
-                caption=(
-                    f"📋 *Quiz:* {quiz['title']}\n\n"
-                    f"📥 Download → Open in any browser (Chrome recommended)\n\n"
-                    f"❓ Questions: {total_q} | ⏱ Timer: {timer_minutes} min | ➖ N.Mark: -{neg_display}"
-                ),
-                parse_mode="Markdown"
-            )
-            
-        if os.path.exists(fname):
-            os.remove(fname)
-            
+        # RAM memory mein file create karna (Folder permission issues khatam!)
+        html_bytes = html_out.encode("utf-8")
+        file_stream = io.BytesIO(html_bytes)
+        file_stream.name = f"practice_quiz_{quiz_id}.html"
+
+        # Caption parse_mode "HTML" kar diya taaki Markdown crash na ho
+        bot.send_document(
+            chat_id, 
+            file_stream,
+            caption=(
+                f"📋 <b>Quiz:</b> {safe_title}\n\n"
+                f"📥 Download → Open in any browser (Chrome recommended)\n\n"
+                f"❓ Questions: {total_q} | ⏱ Timer: {timer_minutes} min | ➖ N.Mark: -{neg_display}"
+            ),
+            parse_mode="HTML"
+        )
+
     except Exception as e:
         logging.error(f"Practice HTML export failed: {e}")
+        # Ab agar kisi wajah se fail hua, toh bot explicitly message bhejega error ke sath
+        bot.send_message(chat_id, f"⚠️ Practice HTML generate karne mein error aaya: `{e}`", parse_mode="Markdown")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
