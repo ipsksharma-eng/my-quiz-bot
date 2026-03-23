@@ -1,2 +1,4 @@
 pyTelegramBotAPI
 Flask
+psycopg2-binary
+dj-database-url
