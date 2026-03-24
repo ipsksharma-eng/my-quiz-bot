@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║          QuizBot Pro — v4.4  Complete (Render-Ready + Pro Logging)           ║
+║          QuizBot Pro — v4.5  Complete (All Fixes Applied)                    ║
+║  ✅ HTML Fix: InputFile wrapper + seek(0) + parse_mode=None                  ║
+║  ✅ Speed Fix: User cache added — no extra DB calls per message              ║
 ║  ✅ Auto-Restart Loop: Prevents bot from dying due to network/API errors     ║
 ║  ✅ Activity Logging: Saves all errors and crashes to bot_activity.log       ║
 ║  ✅ Last Quiz Memory: Bare /start in group restarts the previous quiz        ║
@@ -14,7 +16,7 @@
 ╚══════════════════════════════════════════════════════════════════════════════╝
 """
 
-import telebot, json, re, os, random, string, html as html_mod, threading, logging, time
+import telebot, json, re, os, random, string, html as html_mod, threading, logging, time, io
 import psycopg2
 from psycopg2.extras import DictCursor
 from psycopg2 import pool
@@ -42,6 +44,7 @@ def run_web_server():
 
 def keep_alive():
     t = Thread(target=run_web_server)
+    t.daemon = True
     t.start()
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -56,15 +59,22 @@ logging.basicConfig(
 logging.info("Bot script started/restarted.")
 
 TOKEN    = "8599439624:AAEMj-en21FpmUk7_Pe7PmbPQ_3rgkg_8bU"
-DATABASE_URL = os.environ.get("DATABASE_URL", "")  # Render env variable mein daalo
-BOT_USER = "SDiscussion_bot"   # without @
-OWNER_ID = 863857194   # ← Apna Telegram user_id yahan daalo (int), e.g. 123456789
+DATABASE_URL = os.environ.get("DATABASE_URL", "")
+BOT_USER = "SDiscussion_bot"
+OWNER_ID = 863857194
 
 bot     = telebot.TeleBot(TOKEN, parse_mode=None)
 _wizard : dict = {}
-_auto_timers: dict = {}   # session_id -> threading.Timer (auto-advance)
+_auto_timers: dict = {}
 _LETTERS = "ABCDEFGHIJ"
 _CORRECT = "\u2705"   # ✅
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SPEED FIX: User Memory Cache (DB call skip)
+# ══════════════════════════════════════════════════════════════════════════════
+_user_cache = set()
+_ban_cache  = set()
+_state_cache: dict = {}
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  DATABASE CONNECTION POOL (SUPER FAST)
@@ -72,6 +82,7 @@ _CORRECT = "\u2705"   # ✅
 
 try:
     db_pool = pool.ThreadedConnectionPool(1, 20, DATABASE_URL)
+    logging.info("Database connection pool created successfully.")
 except Exception as e:
     logging.error(f"Connection pool error: {e}")
     db_pool = None
@@ -102,8 +113,6 @@ class _PgWrapper:
             self._conn.rollback()
         else:
             self._conn.commit()
-        
-        # Connection band karne ke bajaye pool mein wapas daalna jisse next reply fast ho
         if db_pool and self._conn:
             db_pool.putconn(self._conn)
         else:
@@ -194,7 +203,6 @@ def init_db():
         conn.execute("CREATE INDEX IF NOT EXISTS idx_sr ON session_results(session_id, user_id)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_as ON active_sessions(user_id, chat_id, is_completed)")
 
-    # Migrations — naye columns add karo agar pehle se nahi hain
     migrations = [
         ("quizzes",          "timer_seconds",    "INTEGER NOT NULL DEFAULT 45"),
         ("quizzes",          "shuffle_q",         "INTEGER NOT NULL DEFAULT 0"),
@@ -215,18 +223,29 @@ def init_db():
             except Exception:
                 pass
 
+    # Boot pe ban cache load karo
+    try:
+        with get_db() as conn:
+            banned_rows = conn.execute("SELECT user_id FROM banned_users").fetchall()
+            for r in banned_rows:
+                _ban_cache.add(r["user_id"])
+        logging.info(f"Ban cache loaded: {len(_ban_cache)} users")
+    except Exception:
+        pass
+
 init_db()
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  HELPERS — USERS / STATE
+#  HELPERS — USERS / STATE (WITH CACHE)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def is_owner(uid):
     return OWNER_ID is not None and uid == OWNER_ID
 
 def is_banned(uid):
-    with get_db() as conn:
-        return conn.execute("SELECT 1 FROM banned_users WHERE user_id=?", (uid,)).fetchone() is not None
+    if uid in _ban_cache:
+        return True
+    return False
 
 def notify_owner(text):
     if not OWNER_ID: return
@@ -237,6 +256,8 @@ def notify_owner(text):
 
 def register_user(msg):
     u = msg.from_user
+    if u.id in _user_cache:
+        return  # DB call skip = FAST
     with get_db() as conn:
         existing = conn.execute("SELECT user_id FROM users WHERE user_id=?", (u.id,)).fetchone()
         conn.execute("INSERT INTO users(user_id,username,first_name) VALUES(?,?,?) "
@@ -253,18 +274,26 @@ def register_user(msg):
                 f"📍 Chat: {chat_type}\n"
                 f"🕐 {datetime.now().strftime('%d %b %Y, %I:%M %p')}"
             )
+    _user_cache.add(u.id)
+    _state_cache[u.id] = "idle"  # new user default state
 
 def get_user(uid):
     with get_db() as conn:
         return conn.execute("SELECT * FROM users WHERE user_id=?", (uid,)).fetchone()
 
 def set_state(uid, state):
+    _state_cache[uid] = state
     with get_db() as conn:
         conn.execute("UPDATE users SET state=? WHERE user_id=?", (state, uid))
 
 def get_state(uid):
+    # Cache se pehle check karo
+    if uid in _state_cache:
+        return _state_cache[uid]
     u = get_user(uid)
-    return u["state"] if u else "idle"
+    state = u["state"] if u else "idle"
+    _state_cache[uid] = state
+    return state
 
 def make_short_id(length=8):
     return "".join(random.choices(string.ascii_uppercase + string.digits, k=length))
@@ -667,7 +696,10 @@ def send_next_poll(session_id):
 
     except telebot.apihelper.ApiTelegramException as exc:
         logging.error(f"Telegram API Exception: {exc}")
-        bot.send_message(sess["chat_id"], f"⚠️ Poll error #{q_idx+1}: {exc.description}\nAuto-skipping to next...")
+        try:
+            bot.send_message(sess["chat_id"], f"⚠️ Poll error #{q_idx+1}: {exc.description}\nAuto-skipping to next...")
+        except Exception:
+            pass
         try:
             with get_db() as conn:
                 conn.execute("UPDATE active_sessions SET current_q_idx=? WHERE session_id=?", (q_idx+1, session_id))
@@ -711,7 +743,6 @@ def _send_leaderboard(session_id, chat_id, quiz_title, neg_val, total_q, session
         return
 
     def short_name(raw):
-        """First name only + trailing emoji. Max 10 chars."""
         import re as _re
         n = (raw or "User").strip()
         orig_parts = n.split()
@@ -719,12 +750,10 @@ def _send_leaderboard(session_id, chat_id, quiz_title, neg_val, total_q, session
         name = _re.sub(r'^[^a-zA-Z0-9]+', '', first_token)
         name = _re.sub(r'[^a-zA-Z0-9]+$', '', name)
         if not name: name = first_token[:10]
-        # CamelCase split: "PalakKeshri"→"Palak", "NavinKl"→"Navin"
         if name and not name.isupper() and not name.islower() and not name.isdigit():
             parts = _re.sub(r'([A-Z])', r' \1', name).split()
             if parts and parts[0].strip(): name = parts[0].strip()
         if len(name) > 10: name = name[:9] + "…"
-        # Keep trailing emoji e.g. "Sunny 🌞"
         if len(orig_parts) > 1 and orig_parts[-1] and ord(orig_parts[-1][0]) > 127:
             name = name + " " + orig_parts[-1]
         return html_mod.escape(name)
@@ -745,7 +774,6 @@ def _send_leaderboard(session_id, chat_id, quiz_title, neg_val, total_q, session
     SEP  = "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     SEP2 = "──────────────────────────────"
 
-    # Olympic podium — gold centre elevated
     if len(players) >= 3:
         p1, p2, p3 = players[0], players[1], players[2]
         podium = (
@@ -763,7 +791,6 @@ def _send_leaderboard(session_id, chat_id, quiz_title, neg_val, total_q, session
     else:
         podium = f"🥇 {players[0]['name']}  —  {players[0]['pct']:.0f}%"
 
-    # Rank lines: icon name  ✅X | ❌X | 🎯score | X%
     rank_map = {0: "👑", 1: "🥈", 2: "🥉"}
     rank_lines = []
     for i, p in enumerate(players):
@@ -878,15 +905,15 @@ footer{{text-align:center;padding:20px;color:#777;font-size:12px;}}
 </header>
 <div class="container">{"".join(q_blocks)}</div>
 <footer>QuizBot Pro</footer></body></html>"""
-    fname = f"quiz_{quiz_id}.html"
+
+    html_bytes = html_out.encode("utf-8")
+    file_stream = io.BytesIO(html_bytes)
+    file_stream.seek(0)
     try:
-        with open(fname, "w", encoding="utf-8") as f: f.write(html_out)
-        with open(fname, "rb") as f:
-            bot.send_document(chat_id, InputFile(f, file_name=fname),
-                caption=f"HTML Export: {quiz['title']} ({len(questions)} Qs)")
-    except Exception as e: safe_send(chat_id, f"Export failed: {e}")
-    finally:
-        if os.path.exists(fname): os.remove(fname)
+        bot.send_document(chat_id, InputFile(file_stream, file_name=f"quiz_{quiz_id}.html"),
+            caption=f"HTML Export: {quiz['title']} ({len(questions)} Qs)")
+    except Exception as e:
+        safe_send(chat_id, f"Export failed: {e}")
 
 def _export_txt(chat_id, quiz_id):
     with get_db() as conn:
@@ -908,29 +935,35 @@ def _export_txt(chat_id, quiz_id):
         lines.append("")
         akey.append(f"  Q{i:>3}.  [{_LETTERS[corr]}]  {opts[corr]}")
     akey.append(sep)
-    fname = f"quiz_{quiz_id}_test.txt"
+
+    txt_bytes = "\n".join(lines + akey).encode("utf-8")
+    file_stream = io.BytesIO(txt_bytes)
+    file_stream.seek(0)
     try:
-        with open(fname, "w", encoding="utf-8") as f: f.write("\n".join(lines + akey))
-        with open(fname, "rb") as f:
-            bot.send_document(chat_id, InputFile(f, file_name=fname),
-                caption=f"Test Series: {quiz['title']} ({len(questions)} Qs + answer key)")
-    except Exception as e: safe_send(chat_id, f"Export failed: {e}")
-    finally:
-        if os.path.exists(fname): os.remove(fname)
+        bot.send_document(chat_id, InputFile(file_stream, file_name=f"quiz_{quiz_id}_test.txt"),
+            caption=f"Test Series: {quiz['title']} ({len(questions)} Qs + answer key)")
+    except Exception as e:
+        safe_send(chat_id, f"Export failed: {e}")
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  INTERACTIVE PRACTICE HTML EXPORT
+#  INTERACTIVE PRACTICE HTML EXPORT (FIXED)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _export_practice_html(chat_id, quiz_id):
     """Quiz khatam hone ke baad interactive practice HTML file send karo."""
     try:
+        time.sleep(3)
+
         with get_db() as conn:
             quiz = conn.execute("SELECT * FROM quizzes WHERE quiz_id=?", (quiz_id,)).fetchone()
-            if not quiz: return
+            if not quiz:
+                logging.error(f"Practice HTML: quiz_id {quiz_id} not found in DB")
+                return
             questions = conn.execute(
                 "SELECT * FROM questions WHERE quiz_id=? ORDER BY position,question_id", (quiz_id,)).fetchall()
-        if not questions: return
+        if not questions:
+            logging.error(f"Practice HTML: quiz_id {quiz_id} has 0 questions")
+            return
 
         neg_val = parse_neg_value(quiz["neg_marking"])
         neg_display = f"{neg_val:.6f}".rstrip('0').rstrip('.') if neg_val else "0"
@@ -1106,24 +1139,33 @@ function retryWrong(){{
 }}
 </script></body></html>"""
 
-        fname = f"practice_{quiz_id}.html"
-        fpath = f"/tmp/{fname}"
-        with open(fpath, "w", encoding="utf-8") as f:
-            f.write(html_out)
-        with open(fpath, "rb") as f:
-            bot.send_document(
-                chat_id, InputFile(f, file_name=fname),
-                caption=(
-                    f"📋 *Quiz:* {quiz['title']}\n\n"
-                    f"📥 Download → Open in any browser (Chrome recommended)\n\n"
-                    f"❓ Questions: {total_q} | ⏱ Timer: {timer_minutes} min | ➖ N.Mark: -{neg_display}"
-                ),
-                parse_mode="Markdown"
-            )
-        os.remove(fpath)
-    except Exception as e:
-        logging.error(f"Practice HTML export failed: {e}")
+        # ═══════════════════════════════════════════════════════════
+        #  FIX: InputFile wrapper + seek(0) + parse_mode=None
+        # ═══════════════════════════════════════════════════════════
+        html_bytes = html_out.encode("utf-8")
+        file_stream = io.BytesIO(html_bytes)
+        file_stream.seek(0)
 
+        caption_text = (
+            f"📋 Quiz: {safe_title}\n\n"
+            f"📥 Download → Open in any browser (Chrome recommended)\n\n"
+            f"❓ Questions: {total_q} | ⏱ Timer: {timer_minutes} min | ➖ N.Mark: -{neg_display}"
+        )
+
+        bot.send_document(
+            chat_id,
+            InputFile(file_stream, file_name=f"practice_quiz_{quiz_id}.html"),
+            caption=caption_text,
+            parse_mode=None
+        )
+        logging.info(f"Practice HTML sent successfully for quiz {quiz_id} to chat {chat_id}")
+
+    except Exception as e:
+        logging.error(f"Practice HTML export failed for quiz {quiz_id}: {e}")
+        try:
+            bot.send_message(chat_id, f"⚠️ Practice HTML generate nahi ho payi: {e}")
+        except Exception as e2:
+            logging.error(f"Even error message failed: {e2}")
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  COMMANDS
@@ -1620,6 +1662,7 @@ def cmd_ban(msg):
             "ON CONFLICT (user_id) DO UPDATE SET banned_by=EXCLUDED.banned_by, reason=EXCLUDED.reason",
                      (target_id, msg.from_user.id, reason))
         user = conn.execute("SELECT first_name, username FROM users WHERE user_id=?", (target_id,)).fetchone()
+    _ban_cache.add(target_id)
     name = (user["first_name"] or str(target_id)) if user else str(target_id)
     uname = (f"@{user['username']}" if user and user["username"] else "") if user else ""
     try: bot.send_message(target_id, f"🚫 Aapko bot se ban kar diya gaya hai.\nKaran: {html_mod.escape(reason)}", parse_mode="HTML")
@@ -1636,6 +1679,7 @@ def cmd_unban(msg):
     target_id = int(parts[1])
     with get_db() as conn:
         deleted = conn.execute("DELETE FROM banned_users WHERE user_id=?", (target_id,)).rowcount
+    _ban_cache.discard(target_id)
     if deleted:
         try: bot.send_message(target_id, "✅ Aapka ban hata diya gaya hai. Ab bot use kar sakte ho.")
         except Exception: pass
@@ -1683,7 +1727,8 @@ def cmd_banlist(msg):
 def handle_text(msg):
     register_user(msg)
     if is_group(msg): return
-    uid, text, state = msg.from_user.id, msg.text.strip(), get_state(msg.from_user.id)
+    uid, text = msg.from_user.id, msg.text.strip()
+    state = get_state(uid)
     if is_banned(uid): return bot.send_message(msg.chat.id, "🚫 Aap banned hain.")
 
     if state == "awaiting_quiz_title":
@@ -1840,11 +1885,10 @@ def handle_inline_query(inline_query):
 
 if __name__ == "__main__":
     print("=" * 60)
-    print("  QuizBot Pro v4.4 (Render-Ready + Auto-Restart)")
+    print("  QuizBot Pro v4.5 (All Fixes — HTML + Speed)")
     print(f"  DB: Supabase PostgreSQL | Bot: @{BOT_USER}")
     print("=" * 60)
     
-    # Start the web server in the background
     keep_alive() 
     
     def start_bot():
@@ -1853,7 +1897,6 @@ if __name__ == "__main__":
                 logging.info("Bot is starting/connecting to Telegram...")
                 print("Bot is running... Faster Polling Enabled.")
                 
-                # Timeout 30 se ghata kar 10 kar diya hai taaki response fast aaye
                 bot.infinity_polling(
                     timeout=10, 
                     long_polling_timeout=5, 
