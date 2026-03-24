@@ -1,4 +1,4 @@
-pyTelegramBotAPI
-Flask
-psycopg2-binary
-dj-database-url
+python-telegram-bot[ext]
+pymongo[srv]
+reportlab
+flask
