@@ -1849,12 +1849,18 @@ def cmd_quizpdf(msg):
     if group_only_reply(msg): return
     register_user(msg)
     uid, parts = msg.from_user.id, msg.text.split(maxsplit=1)
-    if len(parts) > 1 and parts[1].strip().isdigit():
-        qid = int(parts[1].strip())
-        threading.Thread(target=_export_pdf_quizpdf, args=(msg.chat.id, qid), daemon=True).start()
+    
+    if len(parts) > 1:
+        id_str = parts[1].strip()
+        # find_quiz function alphanumeric IDs (ZO6AQOYQ) ko pehchan lega
+        quiz = find_quiz(uid, id_str) 
+        if quiz:
+            threading.Thread(target=_export_pdf_quizpdf, args=(msg.chat.id, quiz['quiz_id']), daemon=True).start()
+        else:
+            safe_send(msg.chat.id, f"❌ Quiz ID `{id_str}` nahi mila ya ye aapka nahi hai.")
     else:
         set_state(uid, "awaiting_txt_id")
-        safe_send(msg.chat.id, "📄 *Quiz PDF*\n\nQuiz ID bhejo — PDF mein har question ke niche answer dikhenga.\n\nUsage: `/quizpdf <quiz_id>`", parse_mode="Markdown")
+        safe_send(msg.chat.id, "📄 *Quiz PDF*\n\nQuiz ID ya Short ID bhejo. PDF mein har question ke niche answer dikhenga.\n\nUsage: `/quizpdf <quiz_id>`", parse_mode="Markdown")
 
 @bot.message_handler(commands=["loadfile"])
 def cmd_loadfile(msg):
