@@ -694,7 +694,7 @@ def send_next_poll(session_id):
                          (msg.poll.id, session_id, q["question_id"], correct_idx, sess["user_id"]))
             conn.execute("UPDATE active_sessions SET current_q_idx=? WHERE session_id=?", (q_idx+1, session_id))
 
-        t = threading.Timer(period + 0.3, _auto_advance, args=[session_id, q_idx + 1])
+        t = threading.Timer(period + 0.15, _auto_advance, args=[session_id, q_idx + 1])
         t.daemon = True
         t.start()
         _auto_timers[session_id] = t
@@ -1026,6 +1026,28 @@ def _generate_quiz_pdf(quiz, questions):
     def _safe(t):
         return _html.escape(str(t or ""))
 
+    def _format_ref_pdf(ref_text):
+        """
+        Numbered statements (1. 2. 3.) aur existing newlines ko
+        alag lines mein todta hai PDF ke liye.
+        e.g. "1. ABC 2. DEF 3. GHI" → "1. ABC<br/>2. DEF<br/>3. GHI"
+        """
+        import re as _re
+        text = str(ref_text or "").strip()
+        lines = text.splitlines()
+        result = []
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            # Ek hi line mein multiple numbered statements split karo
+            parts = _re.split(r'\s+(?=\d+[\.\)]\s)', line)
+            for part in parts:
+                part = part.strip()
+                if part:
+                    result.append(_html.escape(part))
+        return '<br/>'.join(result) if result else _html.escape(text)
+
     PAGE_W, PAGE_H = A4
     C_HEADER      = HexColor("#1a237e")   # dark blue
     C_ACCENT      = HexColor("#e53935")   # red stripe
@@ -1174,7 +1196,7 @@ def _generate_quiz_pdf(quiz, questions):
         # Reference / statement block
         if ref.strip():
             ref_tbl = Table(
-                [[Paragraph(_safe(ref), styles["ref"])]],
+                [[Paragraph(_format_ref_pdf(ref), styles["ref"])]],
                 colWidths=[aw]
             )
             ref_tbl.setStyle(TableStyle([
