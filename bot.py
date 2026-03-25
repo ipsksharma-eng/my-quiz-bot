@@ -980,357 +980,143 @@ def _export_txt(chat_id, quiz_id):
         safe_send(chat_id, f"Export failed: {e}")
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  PDF EXPORT  — ReportLab (professional quality, Hindi font support)
-#  /quizpdf <id>  →  answer below each question, proper header/footer
+#  PDF EXPORT  — FPDF2 (Perfect Hindi Text Shaping)
 # ══════════════════════════════════════════════════════════════════════════════
+from fpdf import FPDF
+import io, json, re
 
-def _setup_pdf_fonts():
-    """Register Hindi fonts for ReportLab if available, else fall back to Helvetica."""
-    global _PDF_FONT_REGULAR, _PDF_FONT_BOLD
-    reg  = os.path.join(".", "NotoSansDevanagari-Regular.ttf")
-    bold = os.path.join(".", "NotoSansDevanagari-Bold.ttf")
-    try:
-        from reportlab.pdfbase import pdfmetrics
-        from reportlab.pdfbase.ttfonts import TTFont
-        if os.path.exists(reg):
-            pdfmetrics.registerFont(TTFont("HindiFont", reg))
-            _PDF_FONT_REGULAR = "HindiFont"
-            logging.info("PDF: Hindi regular font loaded.")
-        if os.path.exists(bold):
-            pdfmetrics.registerFont(TTFont("HindiFontBold", bold))
-            _PDF_FONT_BOLD = "HindiFontBold"
-            logging.info("PDF: Hindi bold font loaded.")
-    except Exception as e:
-        logging.warning(f"PDF font setup: {e} — using Helvetica fallback.")
+class HindiPDF(FPDF):
+    def __init__(self, title, qid, total_q, neg_marking, timer):
+        # Yahan shaping=True Hindi ki matraon ko theek karta hai
+        super().__init__(text_shaping=True)
+        self.quiz_title = title
+        self.qid = qid
+        self.total_q = total_q
+        self.neg_marking = neg_marking
+        self.timer = timer
+        
+        # Aapke upload kiye hue fonts
+        try:
+            self.add_font("Hindi", style="", fname="NotoSansDevanagari-Regular.ttf")
+            self.add_font("Hindi", style="B", fname="NotoSansDevanagari-Bold.ttf")
+        except Exception as e:
+            logging.error(f"Font error: {e}")
 
-_PDF_FONT_REGULAR = "Helvetica"
-_PDF_FONT_BOLD    = "Helvetica-Bold"
-_setup_pdf_fonts()
+    def header(self):
+        self.set_fill_color(26, 35, 126)
+        self.rect(0, 0, 210, 25, "F")
+        self.set_y(8)
+        self.set_font("Hindi", "B", 16)
+        self.set_text_color(255, 255, 255)
+        self.cell(0, 8, self.quiz_title, align="C", new_x="LMARGIN", new_y="NEXT")
+        self.set_font("Hindi", "", 10)
+        self.set_text_color(144, 202, 249)
+        self.cell(0, 6, f"Quiz ID: {self.qid}   |   {self.total_q} Questions", align="C", new_x="LMARGIN", new_y="NEXT")
+        self.ln(10)
 
-
-def _generate_quiz_pdf(quiz, questions):
-    """
-    Build a professional PDF using ReportLab.
-    Returns io.BytesIO with the PDF bytes.
-    """
-    from reportlab.lib.pagesizes import A4
-    from reportlab.lib.units import cm
-    from reportlab.lib.colors import HexColor, black, white
-    from reportlab.lib.styles import ParagraphStyle
-    from reportlab.platypus import (
-        SimpleDocTemplate, Paragraph, Spacer,
-        Table, TableStyle, KeepTogether, HRFlowable,
-    )
-    import html as _html
-
-    def _safe(t):
-        return _html.escape(str(t or ""))
-
-    def _format_ref_pdf(ref_text):
-        """
-        Numbered statements (1. 2. 3.) aur existing newlines ko
-        alag lines mein todta hai PDF ke liye.
-        e.g. "1. ABC 2. DEF 3. GHI" → "1. ABC<br/>2. DEF<br/>3. GHI"
-        """
-        import re as _re
-        text = str(ref_text or "").strip()
-        lines = text.splitlines()
-        result = []
-        for line in lines:
-            line = line.strip()
-            if not line:
-                continue
-            # Ek hi line mein multiple numbered statements split karo
-            parts = _re.split(r'\s+(?=\d+[\.\)]\s)', line)
-            for part in parts:
-                part = part.strip()
-                if part:
-                    result.append(_html.escape(part))
-        return '<br/>'.join(result) if result else _html.escape(text)
-
-    PAGE_W, PAGE_H = A4
-    C_HEADER      = HexColor("#1a237e")   # dark blue
-    C_ACCENT      = HexColor("#e53935")   # red stripe
-    C_GREEN       = HexColor("#2e7d32")
-    C_LIGHT_GREEN = HexColor("#e8f5e9")
-    C_GREEN_BDR   = HexColor("#4caf50")
-    C_GREY        = HexColor("#757575")
-    C_LIGHT_GREY  = HexColor("#f5f5f5")
-    C_BORDER      = HexColor("#e0e0e0")
-    C_OPTION      = HexColor("#424242")
-    C_BLUE_Q      = HexColor("#1565c0")
-
-    FNT  = _PDF_FONT_REGULAR
-    FNTB = _PDF_FONT_BOLD
-
-    # ── styles ────────────────────────────────────────────────────────────────
-    styles = {
-        "inst_title": ParagraphStyle(
-            "IT", fontName=FNTB, fontSize=11,
-            textColor=C_HEADER, spaceBefore=5, spaceAfter=3,
-        ),
-        "inst": ParagraphStyle(
-            "IN", fontName=FNT, fontSize=9.5,
-            textColor=black, leftIndent=10, spaceBefore=2, spaceAfter=2, leading=13,
-        ),
-        "question": ParagraphStyle(
-            "Q", fontName=FNTB, fontSize=10.5,
-            textColor=HexColor("#212121"), spaceBefore=3, spaceAfter=4, leading=15,
-        ),
-        "ref": ParagraphStyle(
-            "R", fontName=FNT, fontSize=9,
-            textColor=HexColor("#555555"), spaceBefore=2, spaceAfter=4,
-            leading=13, leftIndent=8, borderPad=4,
-        ),
-        "option": ParagraphStyle(
-            "O", fontName=FNT, fontSize=10,
-            textColor=C_OPTION, leftIndent=20, spaceBefore=1, spaceAfter=1, leading=13,
-        ),
-        "answer": ParagraphStyle(
-            "A", fontName=FNTB, fontSize=10,
-            textColor=C_GREEN, leftIndent=5, spaceBefore=2, spaceAfter=2, leading=14,
-        ),
-    }
-
-    # ── page callbacks ────────────────────────────────────────────────────────
-    title  = quiz.get("title", "Quiz")
-    qid    = quiz.get("short_id") or str(quiz.get("quiz_id", ""))
-    neg_v  = parse_neg_value(quiz.get("neg_marking", "0"))
-    neg_d  = f"{neg_v:.4f}".rstrip("0").rstrip(".") if neg_v else "0"
-
-    def _first_page(c, doc):
-        c.saveState()
-        h = 2.2 * cm
-        c.setFillColor(C_HEADER)
-        c.rect(0, PAGE_H - h, PAGE_W, h, fill=1, stroke=0)
-        c.setFillColor(C_ACCENT)
-        c.rect(0, PAGE_H - h, PAGE_W, 3, fill=1, stroke=0)
-        c.setFillColor(white)
-        c.setFont(FNTB, 18)
-        tw = c.stringWidth(title, FNTB, 18)
-        c.drawString((PAGE_W - tw) / 2, PAGE_H - 1.0 * cm, title)
-        c.setFont(FNT, 9)
-        c.setFillColor(HexColor("#90caf9"))
-        sub = f"Quiz ID: {qid}   |   {len(questions)} Questions"
-        tw  = c.stringWidth(sub, FNT, 9)
-        c.drawString((PAGE_W - tw) / 2, PAGE_H - 1.6 * cm, sub)
-        _footer_cb(c, doc)
-        c.restoreState()
-
-    def _later_pages(c, doc):
-        c.saveState()
-        h = 1.0 * cm
-        c.setFillColor(C_HEADER)
-        c.rect(0, PAGE_H - h, PAGE_W, h, fill=1, stroke=0)
-        c.setFillColor(C_ACCENT)
-        c.rect(0, PAGE_H - h, PAGE_W, 2, fill=1, stroke=0)
-        c.setFillColor(white)
-        c.setFont(FNTB, 10)
-        c.drawString(1.5 * cm, PAGE_H - 0.65 * cm, title)
-        c.setFont(FNT, 9)
-        pg = f"Page {doc.page}"
-        tw = c.stringWidth(pg, FNT, 9)
-        c.drawString(PAGE_W - 1.5 * cm - tw, PAGE_H - 0.65 * cm, pg)
-        _footer_cb(c, doc)
-        c.restoreState()
-
-    def _footer_cb(c, doc):
-        c.setStrokeColor(C_BORDER)
-        c.setLineWidth(0.5)
-        c.line(1.5 * cm, 1.2 * cm, PAGE_W - 1.5 * cm, 1.2 * cm)
-        c.setFillColor(C_GREY)
-        c.setFont(FNT, 7.5)
-        c.drawString(1.5 * cm, 0.7 * cm, title)
-        it = f"Quiz ID: {qid}"
-        tw = c.stringWidth(it, FNT, 7.5)
-        c.drawString((PAGE_W - tw) / 2, 0.7 * cm, it)
-        pg = f"Page {doc.page}"
-        tw = c.stringWidth(pg, FNT, 7.5)
-        c.drawString(PAGE_W - 1.5 * cm - tw, 0.7 * cm, pg)
-    # ─────────────────────────────────────────────────────────────────────────
-
-    buf = io.BytesIO()
-    doc = SimpleDocTemplate(
-        buf, pagesize=A4,
-        leftMargin=1.5 * cm, rightMargin=1.5 * cm,
-        topMargin=2.5 * cm, bottomMargin=1.8 * cm,
-    )
-    aw    = PAGE_W - 3.0 * cm
-    story = [Spacer(1, 0.3 * cm)]
-
-    # Instructions box
-    inst_rows = [
-        [Paragraph("<b>Instructions / निर्देश:</b>", styles["inst_title"])],
-        [Paragraph(f"• Total Questions / कुल प्रश्न: {len(questions)}", styles["inst"])],
-        [Paragraph(f"• Negative / ऋणात्मक: {neg_d}", styles["inst"])],
-        [Paragraph(f"• Timer / समय: {quiz.get('timer_seconds', 45)}s per question", styles["inst"])],
-        [Paragraph("• Each question carries equal marks / प्रत्येक प्रश्न समान अंक का है", styles["inst"])],
-        [Paragraph("• Answer below each question / उत्तर हर प्रश्न के नीचे दिया गया है", styles["inst"])],
-        [Paragraph(f"• Date: {datetime.now().strftime('%d %b %Y')}", styles["inst"])],
-    ]
-    it = Table(inst_rows, colWidths=[aw])
-    it.setStyle(TableStyle([
-        ("BACKGROUND",    (0, 0), (-1, -1), C_LIGHT_GREY),
-        ("BOX",           (0, 0), (-1, -1), 1,  C_BORDER),
-        ("TOPPADDING",    (0, 0), (-1,  0), 8),
-        ("BOTTOMPADDING", (0,-1), (-1, -1), 8),
-        ("LEFTPADDING",   (0, 0), (-1, -1), 12),
-        ("RIGHTPADDING",  (0, 0), (-1, -1), 12),
-        ("TOPPADDING",    (0, 1), (-1, -1), 2),
-        ("BOTTOMPADDING", (0, 1), (-1, -2), 2),
-    ]))
-    story.extend([it, Spacer(1, 0.5 * cm)])
-
-    # Questions
-    labels = ["(A)", "(B)", "(C)", "(D)", "(E)", "(F)", "(G)", "(H)", "(I)", "(J)"]
-
-    for q in questions:
-        qn   = q.get("position", 0) + 1  # 1-based display number
-        qt   = q.get("q_text", "")
-        ref  = q.get("ref_text", "") or ""
-        opts = json.loads(q["options"]) if isinstance(q.get("options"), str) else (q.get("options") or [])
-        cor  = q.get("correct_idx", 0)
-
-        block = []
-
-        # Reference / statement block
-        if ref.strip():
-            ref_tbl = Table(
-                [[Paragraph(_format_ref_pdf(ref), styles["ref"])]],
-                colWidths=[aw]
-            )
-            ref_tbl.setStyle(TableStyle([
-                ("BACKGROUND",    (0, 0), (-1, -1), HexColor("#f8f9fa")),
-                ("LEFTPADDING",   (0, 0), (-1, -1), 10),
-                ("RIGHTPADDING",  (0, 0), (-1, -1), 10),
-                ("TOPPADDING",    (0, 0), (-1, -1), 6),
-                ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
-                ("LINEBEFORE",    (0, 0), (0, -1),  2, HexColor("#aaaaaa")),
-            ]))
-            block.append(ref_tbl)
-            block.append(Spacer(1, 4))
-
-        # Question text
-        block.append(Paragraph(
-            f'<font color="#1565c0"><b>Q{qn}.</b></font>  {_safe(qt)}',
-            styles["question"],
-        ))
-
-        # Options
-        for i, o in enumerate(opts):
-            lb = labels[i] if i < len(labels) else f"({i+1})"
-            block.append(Paragraph(f"{lb}  {_safe(o)}", styles["option"]))
-
-        block.append(Spacer(1, 4))
-
-        # Answer box (green highlight)
-        if 0 <= cor < len(opts):
-            al = labels[cor] if cor < len(labels) else f"({cor+1})"
-            at = opts[cor]
-        else:
-            al, at = "?", "N/A"
-
-        ans_p = Paragraph(
-            f"<b>✓ उत्तर (Answer): {al}  {_safe(at)}</b>",
-            styles["answer"]
-        )
-        ans_inner = Table([[ans_p]], colWidths=[aw - 0.6 * cm])
-        ans_inner.setStyle(TableStyle([
-            ("BACKGROUND",    (0, 0), (-1, -1), C_LIGHT_GREEN),
-            ("BOX",           (0, 0), (-1, -1), 1, C_GREEN_BDR),
-            ("LEFTPADDING",   (0, 0), (-1, -1), 10),
-            ("RIGHTPADDING",  (0, 0), (-1, -1), 10),
-            ("TOPPADDING",    (0, 0), (-1, -1), 6),
-            ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
-        ]))
-        ans_outer = Table([[ans_inner]], colWidths=[aw])
-        ans_outer.setStyle(TableStyle([
-            ("ALIGN",         (0, 0), (-1, -1), "LEFT"),
-            ("LEFTPADDING",   (0, 0), (-1, -1), 3),
-            ("TOPPADDING",    (0, 0), (-1, -1), 0),
-            ("BOTTOMPADDING", (0, 0), (-1, -1), 0),
-        ]))
-        block.append(ans_outer)
-        block.append(Spacer(1, 4))
-        block.append(HRFlowable(
-            width="90%", thickness=0.5, color=C_BORDER,
-            spaceBefore=3, spaceAfter=8,
-        ))
-
-        story.append(KeepTogether(block))
-
-    doc.build(story, onFirstPage=_first_page, onLaterPages=_later_pages)
-    buf.seek(0)
-    return buf
-
+    def footer(self):
+        self.set_y(-15)
+        self.set_font("Hindi", "", 8)
+        self.set_text_color(117, 117, 117)
+        self.cell(0, 10, f"Page {self.page_no()}", align="R")
 
 def _export_pdf_quizpdf(chat_id, quiz_id):
-    """Fetch quiz from DB and send professional ReportLab PDF."""
-    # Check reportlab available
     try:
-        import reportlab  # noqa
+        from fpdf import FPDF
     except ImportError:
-        safe_send(
-            chat_id,
-            "⚠️ *reportlab* library nahi hai!\n\n"
-            "Render ke `requirements.txt` mein ye line add karo:\n"
-            "`reportlab`\n\nTab tak TXT format bhej raha hun...",
-            parse_mode="Markdown"
-        )
-        _export_txt(chat_id, quiz_id)
+        safe_send(chat_id, "⚠️ fpdf2 ya uharfbuzz install nahi hai!")
         return
 
     with get_db() as conn:
         quiz = conn.execute("SELECT * FROM quizzes WHERE quiz_id=?", (quiz_id,)).fetchone()
-        if not quiz:
-            safe_send(chat_id, f"❌ Quiz ID `{quiz_id}` nahi mila.", parse_mode="Markdown")
-            return
-        questions = conn.execute(
-            "SELECT * FROM questions WHERE quiz_id=? ORDER BY position, question_id",
-            (quiz_id,)
-        ).fetchall()
+        if not quiz: return safe_send(chat_id, f"❌ Quiz ID `{quiz_id}` nahi mila.")
+        questions = conn.execute("SELECT * FROM questions WHERE quiz_id=? ORDER BY position, question_id", (quiz_id,)).fetchall()
 
-    if not questions:
-        safe_send(chat_id, "❌ Is quiz mein koi question nahi hai.")
-        return
-
-    safe_send(chat_id, "⏳ <b>PDF ban rahi hai...</b>", parse_mode="HTML")
+    if not questions: return safe_send(chat_id, "❌ Is quiz mein koi question nahi hai.")
+    safe_send(chat_id, "⏳ <b>PDF ban rahi hai (Shuddh Hindi)...</b>", parse_mode="HTML")
 
     try:
-        # Convert psycopg2 DictRow to plain dict for ReportLab function
-        quiz_dict = dict(quiz)
-        qs_list   = [dict(q) for q in questions]
+        title = quiz["title"]
+        sid = quiz.get("short_id") or str(quiz_id)
+        neg_val = parse_neg_value(quiz.get("neg_marking", "0"))
+        neg_d = f"{neg_val:.4f}".rstrip("0").rstrip(".") if neg_val else "0"
+        
+        pdf = HindiPDF(title, sid, len(questions), neg_d, quiz.get('timer_seconds', 45))
+        pdf.add_page()
+        
+        pdf.set_fill_color(245, 245, 245)
+        pdf.rect(10, 28, 190, 45, "F")
+        pdf.set_y(30)
+        pdf.set_x(15)
+        pdf.set_font("Hindi", "B", 11)
+        pdf.set_text_color(26, 35, 126)
+        pdf.cell(0, 6, "Instructions / निर्देश:", new_x="LMARGIN", new_y="NEXT")
+        pdf.set_x(15)
+        pdf.set_font("Hindi", "", 10)
+        pdf.set_text_color(0, 0, 0)
+        
+        inst_text = (f"• Total Questions / कुल प्रश्न: {len(questions)}\n"
+                     f"• Negative / ऋणात्मक: {neg_d}\n"
+                     f"• Timer / समय: {quiz.get('timer_seconds', 45)}s per question\n"
+                     f"• Answer below each question / उत्तर हर प्रश्न के नीचे दिया गया है\n"
+                     f"• Date: {datetime.now().strftime('%d %b %Y')}")
+        pdf.multi_cell(0, 6, inst_text)
+        pdf.ln(10)
 
-        pdf_buf  = _generate_quiz_pdf(quiz_dict, qs_list)
-        title    = quiz["title"]
-        sid      = quiz.get("short_id") or str(quiz_id)
+        labels = ["(A)", "(B)", "(C)", "(D)", "(E)", "(F)"]
+        
+        for q in questions:
+            qn = q.get("position", 0) + 1
+            qt = q.get("q_text", "")
+            ref = q.get("ref_text", "")
+            opts = json.loads(q["options"])
+            cor = q.get("correct_idx", 0)
 
-        # Clean filename
-        import re as _re
-        clean = _re.sub(r"[^\w\s\-]", "", title)
-        clean = _re.sub(r"\s+", "_", clean.strip())
-        fname = f"{clean}_{sid}.pdf"
+            if ref and ref.strip():
+                pdf.set_font("Hindi", "", 9)
+                pdf.set_text_color(85, 85, 85)
+                pdf.set_fill_color(248, 249, 250)
+                pdf.multi_cell(0, 5, ref, fill=True)
+                pdf.ln(2)
 
-        caption = (
-            f"📄 <b>{html_mod.escape(title)}</b>\n"
-            f"📊 Questions: {len(questions)} | 🆔 <code>{sid}</code>\n"
-            f"✅ Har question ke niche answer diya gaya hai"
-        )
+            pdf.set_font("Hindi", "B", 11)
+            pdf.set_text_color(21, 101, 192)
+            pdf.write(6, f"Q{qn}. ")
+            pdf.set_text_color(33, 33, 33)
+            pdf.write(6, f"{qt}\n")
+            
+            pdf.set_font("Hindi", "", 10)
+            pdf.set_text_color(66, 66, 66)
+            for i, o in enumerate(opts):
+                lb = labels[i] if i < len(labels) else f"({i+1})"
+                pdf.multi_cell(0, 6, f"{lb}  {o}")
+            
+            pdf.ln(2)
+            
+            al = labels[cor] if cor < len(labels) else f"({cor+1})"
+            at = opts[cor] if 0 <= cor < len(opts) else "N/A"
+            
+            pdf.set_font("Hindi", "B", 10)
+            pdf.set_text_color(46, 125, 50)
+            pdf.set_fill_color(232, 245, 233)
+            pdf.multi_cell(0, 8, f"✓ उत्तर (Answer): {al}  {at}", fill=True)
+            pdf.ln(5)
 
+        pdf_bytes = bytearray(pdf.output())
+        pdf_buf = io.BytesIO(pdf_bytes)
         pdf_buf.seek(0)
-        bot.send_document(
-            chat_id,
-            InputFile(pdf_buf, file_name=fname),
-            caption=caption,
-            parse_mode="HTML"
-        )
+        
+        clean = re.sub(r"[^\w\s\-]", "", title)
+        clean = re.sub(r"\s+", "_", clean.strip())
+        fname = f"{clean}_{sid}.pdf"
+        
+        caption = f"📄 <b>{html_mod.escape(title)}</b>\n📊 Questions: {len(questions)} | 🆔 <code>{sid}</code>\n✅ Shuddh Hindi PDF"
+        bot.send_document(chat_id, InputFile(pdf_buf, file_name=fname), caption=caption, parse_mode="HTML")
+        
     except Exception as e:
-        logging.error(f"quizpdf error quiz_id={quiz_id}: {e}", exc_info=True)
-        safe_send(chat_id, f"❌ PDF error: {e}\nTXT format try kar raha hun...")
-        _export_txt(chat_id, quiz_id)
+        logging.error(f"quizpdf error: {e}", exc_info=True)
+        safe_send(chat_id, f"❌ PDF error: {e}")
 
-
-# Alias: /testseries bhi same PDF generate kare
 _export_pdf_testseries = _export_pdf_quizpdf
 
 # ══════════════════════════════════════════════════════════════════════════════
