@@ -63,7 +63,7 @@ logging.basicConfig(
 )
 logging.info("Bot script started/restarted.")
 
-TOKEN    = "8599439624:AAEMj-en21FpmUk7_Pe7PmbPQ_3rgkg_8bU"
+TOKEN    = os.environ.get("BOT_TOKEN")
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
 BOT_USER = "SDiscussion_bot"
 OWNER_ID = 863857194
