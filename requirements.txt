@@ -2,5 +2,5 @@ pyTelegramBotAPI
 Flask
 psycopg2-binary
 dj-database-url
-fpdf2
-uharfbuzz
+fpdf2>=2.8.1
+uharfbuzz>=0.39.0
