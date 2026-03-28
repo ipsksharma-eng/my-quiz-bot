@@ -896,7 +896,7 @@ def send_individual_result(chat_id, uid):
         results = conn.execute("""SELECT sr.selected_idx, sr.is_correct, q.q_text, q.options, q.correct_idx 
             FROM session_results sr JOIN questions q ON sr.question_id=q.question_id 
             WHERE sr.session_id=? AND sr.user_id=? ORDER BY sr.result_id""", (sess["session_id"], uid)).fetchall()
-        quiz = conn.execute("title,neg_marking FROM quizzes WHERE quiz_id=?", (sess["quiz_id"],)).fetchone()
+        quiz = conn.execute("SELECT title,neg_marking FROM quizzes WHERE quiz_id=?", (sess["quiz_id"],)).fetchone()
 
     total   = sess["total_q"] or len(results)
     correct = sum(1 for r in results if r["is_correct"])
@@ -934,15 +934,10 @@ def _export_html(chat_id, quiz_id):
         opts = json.loads(q["options"])
         ref  = html_mod.escape(q["ref_text"] or "")
         ref_html = f'<div class="ref">{ref}</div>' if ref else ""
-        
-        # --- FIXED F-STRING SYNTAX HERE ---
-        lis_arr = []
-        for j, o in enumerate(opts):
-            cls = ' class="correct"' if j == q["correct_idx"] else ''
-            lis_arr.append(f'<li{cls}>{_LETTERS[j]}) {html_mod.escape(o)}</li>')
-        lis = "".join(lis_arr)
-        # ----------------------------------
-
+        lis  = "".join(
+            f'<li{"  class=\"correct\"" if j==q["correct_idx"] else ""}>'
+            f'{_LETTERS[j]}) {html_mod.escape(o)}</li>'
+            for j, o in enumerate(opts))
         q_blocks.append(f"""<div class="question">
   <p class="qnum">Q{i} <span>/ {len(questions)}</span></p>
   {ref_html}
@@ -2127,7 +2122,7 @@ if __name__ == "__main__":
     print(f"  DB: Supabase PostgreSQL | Bot: @{BOT_USER}")
     print("=" * 60)
     
-    # keep_alive()  # FPS.ms pe zarurat nahi — sleep nahi hota
+    keep_alive()
     
     def start_bot():
         while True:
