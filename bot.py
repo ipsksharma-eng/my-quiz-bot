@@ -2186,27 +2186,31 @@ if __name__ == "__main__":
 
     if RENDER_URL:
         # ── WEBHOOK MODE (Render pe — production) ───────────────────────────
+        # 🔑 KEY FIX: Flask PEHLE start karo taaki Render port detect kare
+        # Webhook setup background thread mein hoga — 3 sec baad
         webhook_url = f"{RENDER_URL}/{TOKEN}"
 
-        # Pehle purana webhook/polling hatao
-        try:
-            bot.remove_webhook()
-            time.sleep(1)
-        except Exception as e:
-            logging.warning(f"remove_webhook failed: {e}")
+        def setup_webhook_bg():
+            """Flask start hone ka wait karo, phir webhook set karo"""
+            time.sleep(3)  # Flask ko port bind karne do
+            try:
+                bot.remove_webhook()
+                time.sleep(1)
+            except Exception as e:
+                logging.warning(f"remove_webhook failed: {e}")
+            try:
+                bot.set_webhook(url=webhook_url, max_connections=40)
+                logging.info(f"✅ Webhook set successfully: {RENDER_URL}/****")
+                print(f"✅ Webhook active!")
+            except Exception as e:
+                logging.error(f"❌ set_webhook FAILED: {e}")
+                print(f"❌ Webhook set failed: {e}")
 
-        # Naya webhook set karo
-        try:
-            bot.set_webhook(url=webhook_url, max_connections=40)
-            logging.info(f"Webhook set: {RENDER_URL}/****")
-            print(f"✅ Webhook mode active: {RENDER_URL}/[TOKEN]")
-            print(f"✅ Flask server starting on port {port}")
-        except Exception as e:
-            logging.error(f"set_webhook FAILED: {e}")
-            print(f"❌ Webhook set failed: {e}")
-            print("   RENDER_URL sahi set hai? Check karo Render environment variables.")
+        # Background mein webhook set karo
+        Thread(target=setup_webhook_bg, daemon=True).start()
 
-        # Flask server run karo — yahi webhook receive karega
+        # Flask TURANT start karo — Render yahi dhundta hai
+        print(f"✅ Flask starting on port {port} (webhook mode)")
         app.run(host='0.0.0.0', port=port)
 
     else:
