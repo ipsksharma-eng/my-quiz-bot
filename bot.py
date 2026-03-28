@@ -1,30 +1,28 @@
 #!/usr/bin/env python3
 """
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║          QuizBot Pro — v5.3  (WEBHOOK MODE — 100% Reliable on Render)     ║
-║  ✅ v5.3 FIX: Polling → Webhook — No more missed messages on Render        ║
-║  ✅ v5.3 FIX: sess/q_idx UnboundLocalError in except block fixed           ║
-║  ✅ v5.3 FIX: Stale sessions auto-cleanup on bot restart                   ║
-║  ✅ v5.3 FIX: Short ID collision check optimized (O(n) → O(1))             ║
-║  ✅ v5.3 FIX: BOT_TOKEN / DATABASE_URL missing pe clear error message      ║
-║  ✅ v5.3 FIX: DB pool size 20→10 (Supabase free tier limit safe)           ║
+║          QuizBot Pro — v5.2  (PERFECT HINDI PDF + No Blank Space)          ║
 ║  ✅ HINDI FIX: script="Deva" + language="hi" — perfect matra rendering     ║
 ║  ✅ BLANK FIX: Tight height estimation — 4-5 questions per page            ║
 ║  ✅ /testseries removed from features, silently redirects to /quizpdf      ║
 ║  ⚡ SPEED FIX: Combined DB calls — 3x faster quiz creation                 ║
+║  ⚡ SPEED FIX: No extra DB check in auto-advance — 1-2s faster             ║
+║  ⚡ SPEED FIX: Reduced timer delay 0.15s → 0.05s                           ║
+║  ⚡ SPEED FIX: Instant "Saving..." feedback before DB write                ║
 ║  ✅ HTML Fix: InputFile wrapper + seek(0) + parse_mode=None                 ║
 ║  ✅ Speed Fix: User cache added — no extra DB calls per message             ║
+║  ✅ Auto-Restart Loop: Prevents bot from dying due to network/API errors    ║
 ║  ✅ Activity Logging: Saves all errors and crashes to bot_activity.log      ║
 ║  ✅ Last Quiz Memory: Bare /start in group restarts the previous quiz       ║
+║  ✅ Fixed Timer: Owner answers no longer skip the timer                     ║
 ║  ✅ Auto-Advance Safety: Database locks & poll errors won't halt the quiz   ║
 ║  ✅ Smart Reference Split: Kathan/Statements auto-split into ref_text       ║
+║  ✅ Render Keep-Alive: Flask server integrated for 24/7 uptime              ║
 ║  ✅ New Leaderboard: 1st center podium, 2nd-3rd sides, 3-line per student  ║
 ║  ✅ /quizpdf → fpdf2 PDF: dark-blue header, answer green box each Q        ║
 ║  ✅ Hindi font: NotoSansDevanagari + HarfBuzz Deva shaping = perfect       ║
-║  ⚡ FAST DATABASE: Connection Pooling for instant replies                   ║
-║                                                                              ║
-║  ENV VARS NEEDED:                                                            ║
-║    BOT_TOKEN, DATABASE_URL, RENDER_URL (e.g. https://yourapp.onrender.com) ║
+║  ⚡ FAST DATABASE: Connection Pooling added for instant replies              ║
+║  ⚡ FAST POLLING: Timeout reduced for quicker Telegram responses            ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
 """
 
@@ -39,21 +37,25 @@ from telebot.types import (ReplyKeyboardMarkup, KeyboardButton,
                            ReplyKeyboardRemove)
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  WEBHOOK SERVER (v5.3 — Polling ki jagah Webhook — 100% Reliable on Render)
+#  RENDER KEEP-ALIVE SERVER
 # ══════════════════════════════════════════════════════════════════════════════
-
-from flask import Flask, request, abort
+from flask import Flask
 from threading import Thread
 
 app = Flask('')
 
-@app.route('/', methods=['GET'])
+@app.route('/')
 def home():
-    return "✅ QuizBot Pro v5.3 is alive! (Webhook Mode)", 200
+    return "Bot is alive and running!"
 
-@app.route('/health', methods=['GET'])
-def health():
-    return "OK", 200
+def run_web_server():
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host='0.0.0.0', port=port)
+
+def keep_alive():
+    t = Thread(target=run_web_server)
+    t.daemon = True
+    t.start()
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  LOGGING SETUP
@@ -66,21 +68,12 @@ logging.basicConfig(
 )
 logging.info("Bot script started/restarted.")
 
-TOKEN        = os.environ.get("BOT_TOKEN", "")
+TOKEN    = os.environ.get("BOT_TOKEN")
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
-RENDER_URL   = os.environ.get("RENDER_URL", "").rstrip("/")  # e.g. https://yourapp.onrender.com
-
-# ── Startup validation ───────────────────────────────────────────────────────
-if not TOKEN:
-    raise ValueError("❌ BOT_TOKEN environment variable set nahi hai! Render dashboard mein add karo.")
-if not DATABASE_URL:
-    raise ValueError("❌ DATABASE_URL environment variable set nahi hai! Render dashboard mein add karo.")
-
 BOT_USER = "SDiscussion_bot"
 OWNER_ID = 863857194
 
-# threaded=True: har update ek alag thread mein handle hoga — webhook ke liye zaroori
-bot = telebot.TeleBot(TOKEN, parse_mode=None, threaded=True)
+bot     = telebot.TeleBot(TOKEN, parse_mode=None)
 _wizard : dict = {}
 _auto_timers: dict = {}
 _LETTERS = "ABCDEFGHIJ"
@@ -98,8 +91,7 @@ _state_cache: dict = {}
 # ══════════════════════════════════════════════════════════════════════════════
 
 try:
-    # Supabase free tier: max ~60 connections. Pool size 10 safe hai.
-    db_pool = pool.ThreadedConnectionPool(2, 10, DATABASE_URL)
+    db_pool = pool.ThreadedConnectionPool(1, 20, DATABASE_URL)
     logging.info("Database connection pool created successfully.")
 except Exception as e:
     logging.error(f"Connection pool error: {e}")
@@ -252,19 +244,9 @@ def init_db():
 
 init_db()
 
-def cleanup_stale_sessions():
-    try:
-        with get_db() as conn:
-            result = conn.execute(
-                "UPDATE active_sessions SET is_completed=1 WHERE is_completed=0 AND is_paused=0"
-            )
-            count = result.rowcount if hasattr(result, 'rowcount') else 0
-        if count:
-            logging.info(f"Cleaned up {count} stale session(s) on startup.")
-    except Exception as e:
-        logging.error(f"Stale session cleanup failed: {e}")
-
-cleanup_stale_sessions()
+# ══════════════════════════════════════════════════════════════════════════════
+#  HELPERS — USERS / STATE (WITH CACHE)
+# ══════════════════════════════════════════════════════════════════════════════
 
 def is_owner(uid):
     return OWNER_ID is not None and uid == OWNER_ID
@@ -331,6 +313,10 @@ def parse_neg_value(neg_str):
     except Exception:
         return 0.0
 
+# ══════════════════════════════════════════════════════════════════════════════
+#  HELPERS — UI / KEYBOARDS
+# ══════════════════════════════════════════════════════════════════════════════
+
 def main_keyboard():
     kb = ReplyKeyboardMarkup(resize_keyboard=True, row_width=3)
     kb.add(KeyboardButton("/create"),   KeyboardButton("/myquizzes"),  KeyboardButton("/startquiz"),
@@ -342,7 +328,7 @@ def main_keyboard():
 def quiz_card_kb(quiz_id, short_id=""):
     kb = InlineKeyboardMarkup(row_width=2)
     kb.add(
-        InlineKeyboardButton("🎯 Start",  callback_data=f"qs_{quiz_id}"),
+        InlineKeyboardButton("     Start",  callback_data=f"qs_{quiz_id}"),
         InlineKeyboardButton("🚀 Group",
             url=f"https://t.me/{BOT_USER}?startgroup=quiz_{quiz_id}")
     )
@@ -417,6 +403,10 @@ def send_edit_panel(chat_id, quiz, q_count, message_id=None):
             bot.send_message(chat_id, text, parse_mode="Markdown", reply_markup=kb)
     except Exception:
         bot.send_message(chat_id, text, reply_markup=kb)
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SMART PARSER FOR KATHAN / STATEMENTS
+# ══════════════════════════════════════════════════════════════════════════════
 
 _OPT_RE = re.compile(r"^[a-zA-Z0-9][).\-:]\s*(.*)", re.UNICODE)
 
@@ -591,6 +581,10 @@ def detect_and_parse(filename, content):
         if r: return r, e
     return bulk_parse_manual(content)
 
+# ══════════════════════════════════════════════════════════════════════════════
+#  DATABASE WRITES (SPEED OPTIMIZED)
+# ══════════════════════════════════════════════════════════════════════════════
+
 def save_questions(quiz_id, questions):
     with get_db() as conn:
         count = conn.execute("SELECT COUNT(*) FROM questions WHERE quiz_id=?", (quiz_id,)).fetchone()[0]
@@ -600,9 +594,13 @@ def save_questions(quiz_id, questions):
              for i, (r, q, o, c) in enumerate(questions)])
 
 def create_quiz_and_save(uid, title, questions, neg="0", quiz_type="free", timer=45):
+    short_id = make_short_id()
     with get_db() as conn:
-        short_id = make_short_id()
-        while conn.execute("SELECT 1 FROM quizzes WHERE short_id=?", (short_id,)).fetchone():
+        existing_ids = set()
+        rows = conn.execute("SELECT short_id FROM quizzes").fetchall()
+        for r in rows:
+            existing_ids.add(r["short_id"])
+        while short_id in existing_ids:
             short_id = make_short_id()
 
         cur = conn.execute(
@@ -625,6 +623,10 @@ def find_quiz(uid, id_str):
         if id_str.isdigit(): return conn.execute("SELECT * FROM quizzes WHERE quiz_id=? AND creator_id=?", (int(id_str), uid)).fetchone()
         return conn.execute("SELECT * FROM quizzes WHERE short_id=? AND creator_id=?", (id_str.upper(), uid)).fetchone()
 
+# ══════════════════════════════════════════════════════════════════════════════
+#  QUIZ SESSION ENGINE (SPEED OPTIMIZED)
+# ══════════════════════════════════════════════════════════════════════════════
+
 def _cancel_auto_timer(session_id):
     t = _auto_timers.pop(session_id, None)
     if t:
@@ -632,6 +634,7 @@ def _cancel_auto_timer(session_id):
         except Exception: pass
 
 def _auto_advance(session_id, expected_q_idx):
+    """SPEED FIX: Direct call — skip extra DB check, send_next_poll handles it"""
     try:
         _auto_timers.pop(session_id, None)
         send_next_poll(session_id)
@@ -639,9 +642,8 @@ def _auto_advance(session_id, expected_q_idx):
         logging.error(f"Auto-advance error for session {session_id}: {e}")
 
 def send_next_poll(session_id):
+    """SPEED FIX: Combined DB calls — single read connection, single write connection"""
     _cancel_auto_timer(session_id)
-
-    sess, q_idx = None, 0
 
     try:
         with get_db() as conn:
@@ -894,7 +896,7 @@ def send_individual_result(chat_id, uid):
         results = conn.execute("""SELECT sr.selected_idx, sr.is_correct, q.q_text, q.options, q.correct_idx 
             FROM session_results sr JOIN questions q ON sr.question_id=q.question_id 
             WHERE sr.session_id=? AND sr.user_id=? ORDER BY sr.result_id""", (sess["session_id"], uid)).fetchall()
-        quiz = conn.execute("SELECT title,neg_marking FROM quizzes WHERE quiz_id=?", (sess["quiz_id"],)).fetchone()
+        quiz = conn.execute("title,neg_marking FROM quizzes WHERE quiz_id=?", (sess["quiz_id"],)).fetchone()
 
     total   = sess["total_q"] or len(results)
     correct = sum(1 for r in results if r["is_correct"])
@@ -916,6 +918,10 @@ def send_individual_result(chat_id, uid):
     full = "\n".join(lines)
     for i in range(0, max(len(full), 1), 4000): safe_send(chat_id, full[i:i+4000], parse_mode="Markdown")
 
+# ══════════════════════════════════════════════════════════════════════════════
+#  EXPORTS
+# ══════════════════════════════════════════════════════════════════════════════
+
 def _export_html(chat_id, quiz_id):
     with get_db() as conn:
         quiz = conn.execute("SELECT * FROM quizzes WHERE quiz_id=?", (quiz_id,)).fetchone()
@@ -928,10 +934,15 @@ def _export_html(chat_id, quiz_id):
         opts = json.loads(q["options"])
         ref  = html_mod.escape(q["ref_text"] or "")
         ref_html = f'<div class="ref">{ref}</div>' if ref else ""
-        lis  = "".join(
-            f'<li{"  class=\"correct\"" if j==q["correct_idx"] else ""}>'
-            f'{_LETTERS[j]}) {html_mod.escape(o)}</li>'
-            for j, o in enumerate(opts))
+        
+        # --- FIXED F-STRING SYNTAX HERE ---
+        lis_arr = []
+        for j, o in enumerate(opts):
+            cls = ' class="correct"' if j == q["correct_idx"] else ''
+            lis_arr.append(f'<li{cls}>{_LETTERS[j]}) {html_mod.escape(o)}</li>')
+        lis = "".join(lis_arr)
+        # ----------------------------------
+
         q_blocks.append(f"""<div class="question">
   <p class="qnum">Q{i} <span>/ {len(questions)}</span></p>
   {ref_html}
@@ -1002,7 +1013,18 @@ def _export_txt(chat_id, quiz_id):
     except Exception as e:
         safe_send(chat_id, f"Export failed: {e}")
 
+# ══════════════════════════════════════════════════════════════════════════════
+#  PDF EXPORT — fpdf2 + uharfbuzz (PERFECT Hindi/Devanagari Text Shaping)
+#  FIX v5.2: script="Deva" + language="hi" + tight height = no blank space
+# ══════════════════════════════════════════════════════════════════════════════
+
 def _generate_quiz_pdf(quiz, questions):
+    """
+    fpdf2 + uharfbuzz — Professional PDF with PERFECT Hindi/Devanagari rendering.
+    FIX: script="Deva" + language="hi" for proper matra/conjunct shaping.
+    FIX: Tight height estimation — no blank space wastage.
+    Returns io.BytesIO with PDF bytes.
+    """
     from fpdf import FPDF
     import re as _re
 
@@ -1063,6 +1085,7 @@ def _generate_quiz_pdf(quiz, questions):
     font_reg  = os.path.join(".", "NotoSansDevanagari-Regular.ttf")
     font_bold = os.path.join(".", "NotoSansDevanagari-Bold.ttf")
 
+    # ── STEP 1: PEHLE fonts add karo ─────────────────────────────────────
     if os.path.exists(font_reg):
         pdf.add_font("hindi", "", font_reg)
         pdf.add_font("hindi", "B", font_bold if os.path.exists(font_bold) else font_reg)
@@ -1073,6 +1096,10 @@ def _generate_quiz_pdf(quiz, questions):
             "Download from https://fonts.google.com/noto/specimen/Noto+Sans+Devanagari"
         )
 
+    # ── STEP 2: BAAD mein HarfBuzz shaping enable karo ───────────────────
+    # CRITICAL FIX: script="Deva" aur language="hi" ZAROORI hai
+    # Bina iske HarfBuzz ko pata nahi chalta ki Devanagari hai,
+    # isliye matras (कि, की, कु) aur conjuncts (क्ष, त्र) toot jaate hain
     try:
         pdf.set_text_shaping(
             use_shaping_engine=True,
@@ -1085,6 +1112,7 @@ def _generate_quiz_pdf(quiz, questions):
 
     pdf.add_page()
 
+    # ── Instructions Box ─────────────────────────────────────────────────
     inst_lines = [
         f"• Total Questions / कुल प्रश्न: {total_q}",
         f"• Negative / ऋणात्मक: {neg_d}",
@@ -1115,6 +1143,7 @@ def _generate_quiz_pdf(quiz, questions):
 
     pdf.set_y(box_y + box_h + 5)
 
+    # ── Questions Loop ───────────────────────────────────────────────────
     for q in questions:
         qn       = q.get("position", 0) + 1
         qt       = str(q.get("q_text", ""))
@@ -1123,6 +1152,7 @@ def _generate_quiz_pdf(quiz, questions):
         opts     = json.loads(opts_raw) if isinstance(opts_raw, str) else (opts_raw or [])
         cor      = q.get("correct_idx", 0)
 
+        # ── TIGHT height estimation (blank space fix) ────────────────────
         q_lines  = max(1, len(qt) // 75 + 1)
         est_h    = 10 + q_lines * 6.5 + len(opts) * 6 + 9
         if ref:
@@ -1130,11 +1160,13 @@ def _generate_quiz_pdf(quiz, questions):
             est_h += ref_lines * 5.5 + 5
         est_h += 6  # separator + gap
 
+        # Page break threshold: 282 = 297(page) - 15(footer area)
         if pdf.get_y() + est_h > 282:
             pdf.add_page()
 
         card_top = pdf.get_y()
 
+        # ── Reference text ───────────────────────────────────────────────
         if ref:
             pdf.set_fill_color(248, 249, 250)
             ref_y = pdf.get_y()
@@ -1150,12 +1182,14 @@ def _generate_quiz_pdf(quiz, questions):
             pdf.set_line_width(0.2)
             pdf.ln(2)
 
+        # ── Question text ────────────────────────────────────────────────
         pdf.set_font("hindi", "B", 10.5)
         pdf.set_text_color(33, 33, 33)
         pdf.set_x(14)
         pdf.multi_cell(182, 6, f"Q{qn}. {qt}", new_x="LMARGIN", new_y="NEXT")
         pdf.ln(1.5)
 
+        # ── Options ──────────────────────────────────────────────────────
         pdf.set_font("hindi", "", 10)
         pdf.set_text_color(66, 66, 66)
         for i, o in enumerate(opts):
@@ -1164,6 +1198,7 @@ def _generate_quiz_pdf(quiz, questions):
             pdf.multi_cell(170, 5.5, f"{lb}  {str(o)}", new_x="LMARGIN", new_y="NEXT")
         pdf.ln(2)
 
+        # ── Answer box (green) ───────────────────────────────────────────
         al = labels[cor] if 0 <= cor < len(labels) else "?"
         at = str(opts[cor]) if 0 <= cor < len(opts) else "N/A"
         ans_text = f"  उत्तर (Answer): {al}  {at}"
@@ -1175,6 +1210,7 @@ def _generate_quiz_pdf(quiz, questions):
         pdf.set_x(14)
         pdf.multi_cell(182, 6.5, ans_text, border=1, fill=True, new_x="LMARGIN", new_y="NEXT")
 
+        # ── Left blue accent line ────────────────────────────────────────
         card_bottom = pdf.get_y()
         pdf.set_draw_color(26, 115, 232)
         pdf.set_line_width(1.0)
@@ -1182,6 +1218,7 @@ def _generate_quiz_pdf(quiz, questions):
         pdf.set_line_width(0.2)
         pdf.ln(1.5)
 
+        # ── Separator line ───────────────────────────────────────────────
         pdf.set_draw_color(224, 224, 224)
         pdf.line(22, pdf.get_y(), 190, pdf.get_y())
         pdf.ln(3)
@@ -1190,7 +1227,9 @@ def _generate_quiz_pdf(quiz, questions):
     buf.seek(0)
     return buf
 
+
 def _export_pdf_quizpdf(chat_id, quiz_id):
+    """Fetch quiz from DB and send professional fpdf2 PDF with perfect Hindi."""
     try:
         from fpdf import FPDF  # noqa
     except ImportError:
@@ -1254,6 +1293,10 @@ def _export_pdf_quizpdf(chat_id, quiz_id):
         logging.error(f"quizpdf error quiz_id={quiz_id}: {e}", exc_info=True)
         safe_send(chat_id, f"❌ PDF error: {e}\nTXT format try kar raha hun...")
         _export_txt(chat_id, quiz_id)
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  INTERACTIVE PRACTICE HTML EXPORT
+# ══════════════════════════════════════════════════════════════════════════════
 
 def _export_practice_html(chat_id, quiz_id):
     try:
@@ -1376,6 +1419,10 @@ function retryWrong(){{const wrong=ALL_QS.filter((q,i)=>ans[i]!==undefined&&ans[
         logging.error(f"Practice HTML export failed for quiz {quiz_id}: {e}")
         try: bot.send_message(chat_id, f"⚠️ Practice HTML generate nahi ho payi: {e}")
         except Exception: pass
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  COMMANDS
+# ══════════════════════════════════════════════════════════════════════════════
 
 def is_group(msg_or_chat_id):
     if isinstance(msg_or_chat_id, int): return msg_or_chat_id < 0
@@ -1791,10 +1838,8 @@ def handle_document(msg):
         send_quiz_created_card(msg.chat.id, uid, quiz_id, short_id, title[:50], q_count, "0", "free", 45)
     else:
         if state == "awaiting_quiz_title":
-            _wizard.setdefault(uid, {}).update({
-                "title": fname[:50], "questions": [],
-                "neg": "0", "quiz_type": "free", "timer": 45, "section": 0
-            })
+            store = _wizard.setdefault(uid, {"title": fname[:50], "questions": [], "neg": "0", "quiz_type": "free", "timer": 45, "section": 0})
+            if not store.get("title"): store["title"] = fname[:50]
         store = _wizard.setdefault(uid, {"questions": []})
         store.setdefault("questions", []).extend(unique)
         total = len(store["questions"])
@@ -2030,6 +2075,10 @@ def handle_text(msg):
         safe_send(msg.chat.id, "Please *upload a file* (attach .txt or .json as document).", parse_mode="Markdown")
     else: safe_send(msg.chat.id, "Use the keyboard or /features for commands.", reply_markup=ReplyKeyboardRemove())
 
+# ══════════════════════════════════════════════════════════════════════════════
+#  POLL ANSWER HANDLER
+# ══════════════════════════════════════════════════════════════════════════════
+
 @bot.poll_answer_handler()
 def handle_poll_answer(poll_answer):
     uid      = poll_answer.user.id
@@ -2069,92 +2118,32 @@ def handle_inline_query(inline_query):
     bot.answer_inline_query(inline_query.id, results, cache_time=1, is_personal=True)
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  WEBHOOK ROUTE — Telegram yahan messages push karta hai
-# ══════════════════════════════════════════════════════════════════════════════
-
-@app.route(f'/{TOKEN}', methods=['POST'])
-def webhook_handler():
-    """Har Telegram update yahan aata hai — Flask is process karta hai."""
-    # FIX 1: .startswith('application/json') use kiya gaya hai taaki strict type checking error na aaye
-    if request.headers.get('content-type', '').startswith('application/json'):
-        json_string = request.get_data().decode('utf-8')
-        update = telebot.types.Update.de_json(json_string)
-        bot.process_new_updates([update])
-        return 'OK', 200
-    else:
-        abort(403)
-
-# ══════════════════════════════════════════════════════════════════════════════
 #  MAIN EXECUTION
 # ══════════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
     print("=" * 60)
-    print("  QuizBot Pro v5.3 (WEBHOOK MODE — Render Optimized)")
+    print("  QuizBot Pro v5.2 (PERFECT HINDI PDF + No Blank Space)")
     print(f"  DB: Supabase PostgreSQL | Bot: @{BOT_USER}")
     print("=" * 60)
-
-    port = int(os.environ.get("PORT", 10000))
-
-    if RENDER_URL:
-        # ── WEBHOOK MODE (Render pe — production) ───────────────────────────
-        webhook_url = f"{RENDER_URL}/{TOKEN}"
-
-        def setup_webhook_bg():
-            """Flask start hone ka wait karo, phir webhook set karo"""
-            time.sleep(3)  # Flask ko port bind karne do
+    
+    # keep_alive()  # FPS.ms pe zarurat nahi — sleep nahi hota
+    
+    def start_bot():
+        while True:
             try:
-                bot.remove_webhook()
-                time.sleep(1)
+                logging.info("Bot is starting/connecting to Telegram...")
+                print("Bot is running... Faster Polling Enabled.")
+                bot.infinity_polling(
+                    timeout=10, long_polling_timeout=5, skip_pending=True,
+                    allowed_updates=["message", "poll_answer", "callback_query", "inline_query"],
+                    logger_level=20)
+            except KeyboardInterrupt:
+                print("\nBot stopped manually.")
+                break
             except Exception as e:
-                logging.warning(f"remove_webhook failed: {e}")
-            try:
-                # 🚀 FIX 2: drop_pending_updates=True add kar diya gaya hai yahan
-                bot.set_webhook(url=webhook_url, max_connections=40, drop_pending_updates=True)
-                logging.info(f"✅ Webhook set successfully: {RENDER_URL}/****")
-                print(f"✅ Webhook active! (Purane atke hue updates clear kar diye gaye)")
-            except Exception as e:
-                logging.error(f"❌ set_webhook FAILED: {e}")
-                print(f"❌ Webhook set failed: {e}")
+                logging.error(f"Bot crashed: {e}")
+                print(f"⚠️ Error: {e}. Restarting in 5s...")
+                time.sleep(5)
 
-        # Background mein webhook set karo
-        Thread(target=setup_webhook_bg, daemon=True).start()
-
-        # Flask TURANT start karo — Render yahi dhundta hai
-        print(f"✅ Flask starting on port {port} (webhook mode)")
-        app.run(host='0.0.0.0', port=port)
-
-    else:
-        # ── POLLING MODE (local development ke liye) ─────────────────────────
-        print("⚠️  RENDER_URL not set — Polling mode (sirf local dev ke liye!)")
-        print("   Production pe RENDER_URL environment variable zaroor set karo.")
-        logging.info("Starting in POLLING mode (local dev).")
-
-        try:
-            bot.remove_webhook()
-            time.sleep(1)
-        except Exception:
-            pass
-
-        def start_bot():
-            while True:
-                try:
-                    logging.info("Bot polling start...")
-                    print("Bot polling... (local mode)")
-                    bot.infinity_polling(
-                        timeout=20,
-                        long_polling_timeout=10,
-                        skip_pending=True,
-                        allowed_updates=["message", "poll_answer", "callback_query", "inline_query"],
-                        logger_level=logging.WARNING)
-                except KeyboardInterrupt:
-                    print("\nBot stopped.")
-                    break
-                except Exception as e:
-                    logging.error(f"Polling crashed: {e}")
-                    print(f"⚠️ Error: {e}. Restarting in 5s...")
-                    time.sleep(5)
-
-        t = Thread(target=lambda: app.run(host='0.0.0.0', port=port), daemon=True)
-        t.start()
-        start_bot()
+    start_bot()
